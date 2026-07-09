@@ -102,6 +102,26 @@ operations = []
     let server = cfg.server.expect("[server] present");
     assert!(server.operations.is_empty());
     assert!(server.parsed_selectors().expect("parse").is_empty());
+    assert!(
+        !server.context_extensions,
+        "context_extensions defaults to false"
+    );
+}
+
+#[test]
+fn context_extensions_opt_in_parses() {
+    let spec_path = std::path::Path::new("specs/openai.yaml");
+    let config_file = write_config(
+        spec_path,
+        r#"[server]
+framework = "axum"
+operations = ["createResponse"]
+context_extensions = true
+"#,
+    );
+    let cfg = ConfigFile::load(config_file.path()).expect("config loads");
+    let server = cfg.server.expect("[server] present");
+    assert!(server.context_extensions);
 }
 
 #[test]

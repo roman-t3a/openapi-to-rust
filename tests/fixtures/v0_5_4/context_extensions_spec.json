@@ -1,0 +1,59 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Context extensions fixture",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/v1/ping": {
+      "post": {
+        "operationId": "ping",
+        "tags": ["Health"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PingResponseBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "PingRequest": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "PingResponseBody": {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

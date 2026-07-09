@@ -502,6 +502,8 @@ operations = [                          # selectors: operationId | "METHOD /path
 ]
 prune_models = false                    # drop schemas unreachable from picked ops
                                         # (safe only when not also generating the HTTP client)
+context_extensions = false              # when true, every trait method gains leading
+                                        # `ctx: RequestContext` (clone of request Extensions)
 
 [nullable_overrides]
 "Response.error" = true                 # see "Spec-quirk overrides" above
@@ -552,6 +554,15 @@ cargo run --manifest-path examples/server-anthropic-messages/Cargo.toml
 ```
 
 ## Release notes
+
+### 0.5.4
+
+**Opt-in request context on server traits**
+- New `[server].context_extensions` flag (default `false`). When unset/false, generated server output is byte-identical to 0.5.3.
+- When `true`, every generated trait method gains a leading `ctx: RequestContext` parameter. Handlers construct it as `RequestContext(parts.extensions.clone())` before body extraction, so middleware-settled state (auth, tenancy, etc.) is available without ambient task-locals.
+- Emits once per generation: `#[derive(Clone)] pub struct RequestContext(pub axum::http::Extensions)` with `get<T>()` delegating to `Extensions::get`.
+- Response enums, routers factories, and DTOs are otherwise unchanged; trait-object / router plumbing still compiles in both flag states.
+- Golden fixtures under `tests/fixtures/v0_5_4/`.
 
 ### 0.5.3
 

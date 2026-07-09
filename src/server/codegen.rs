@@ -434,11 +434,21 @@ impl<'a> ServerCodegen<'a> {
     fn emit_axum_handler(&self, trait_ident: &syn::Ident, op: &OperationInfo) -> TokenStream {
         let handler_ident = format_ident!("{}_handler", op.operation_id.to_snake_case());
         let trait_method = format_ident!("{}", op.operation_id.to_snake_case());
+        let context_extensions = self.server.context_extensions;
 
         // Build extractor list + call argument list.
+        // When context_extensions is on we take the full request, split
+        // parts/body, clone extensions into RequestContext, then run the
+        // same extractors via FromRequestParts / FromRequest so body
+        // extraction still happens after the extensions clone.
         let mut extractors: Vec<TokenStream> =
             vec![quote! { ::axum::extract::State(api): ::axum::extract::State<T> }];
+        let mut parts_binds: Vec<TokenStream> = Vec::new();
         let mut call_args: Vec<TokenStream> = Vec::new();
+
+        if context_extensions {
+            call_args.push(quote! { ctx });
+        }
 
         // Path parameters → axum::extract::Path tuple
         let path_params: Vec<&_> = op
@@ -456,9 +466,43 @@ impl<'a> ServerCodegen<'a> {
             if path_params.len() == 1 {
                 let i = &idents[0];
                 let t = &types[0];
-                extractors.push(quote! { ::axum::extract::Path(#i): ::axum::extract::Path<#t> });
+                if context_extensions {
+                    parts_binds.push(quote! {
+                        let ::axum::extract::Path(#i) = match <::axum::extract::Path<#t> as ::axum::extract::FromRequestParts<T>>::from_request_parts(
+                            &mut parts,
+                            &api,
+                        )
+                        .await
+                        {
+                            ::std::result::Result::Ok(v) => v,
+                            ::std::result::Result::Err(rej) => {
+                                return ::axum::response::IntoResponse::into_response(rej);
+                            }
+                        };
+                    });
+                } else {
+                    extractors.push(quote! {
+                        ::axum::extract::Path(#i): ::axum::extract::Path<#t>
+                    });
+                }
+            } else if context_extensions {
+                parts_binds.push(quote! {
+                    let ::axum::extract::Path((#(#idents),*)) = match <::axum::extract::Path<(#(#types),*)> as ::axum::extract::FromRequestParts<T>>::from_request_parts(
+                        &mut parts,
+                        &api,
+                    )
+                    .await
+                    {
+                        ::std::result::Result::Ok(v) => v,
+                        ::std::result::Result::Err(rej) => {
+                            return ::axum::response::IntoResponse::into_response(rej);
+                        }
+                    };
+                });
             } else {
-                extractors.push(quote! { ::axum::extract::Path((#(#idents),*)): ::axum::extract::Path<(#(#types),*)> });
+                extractors.push(quote! {
+                    ::axum::extract::Path((#(#idents),*)): ::axum::extract::Path<(#(#types),*)>
+                });
             }
             for i in &idents {
                 call_args.push(quote! { #i });
@@ -477,9 +521,25 @@ impl<'a> ServerCodegen<'a> {
         let mut required_query_checks: Vec<TokenStream> = Vec::new();
         if !query_params.is_empty() {
             let query_ident = format_ident!("{}Query", op.operation_id.to_pascal_case());
-            extractors.push(quote! {
-                ::axum::extract::Query(__q): ::axum::extract::Query<#query_ident>
-            });
+            if context_extensions {
+                parts_binds.push(quote! {
+                    let ::axum::extract::Query(__q) = match <::axum::extract::Query<#query_ident> as ::axum::extract::FromRequestParts<T>>::from_request_parts(
+                        &mut parts,
+                        &api,
+                    )
+                    .await
+                    {
+                        ::std::result::Result::Ok(v) => v,
+                        ::std::result::Result::Err(rej) => {
+                            return ::axum::response::IntoResponse::into_response(rej);
+                        }
+                    };
+                });
+            } else {
+                extractors.push(quote! {
+                    ::axum::extract::Query(__q): ::axum::extract::Query<#query_ident>
+                });
+            }
             for p in &query_params {
                 let f = server_param_ident(p);
                 let wire = p.name.as_str();
@@ -515,7 +575,23 @@ impl<'a> ServerCodegen<'a> {
             .collect();
         let mut required_header_checks: Vec<TokenStream> = Vec::new();
         if !header_params.is_empty() {
-            extractors.push(quote! { __headers: ::axum::http::HeaderMap });
+            if context_extensions {
+                parts_binds.push(quote! {
+                    let __headers = match <::axum::http::HeaderMap as ::axum::extract::FromRequestParts<T>>::from_request_parts(
+                        &mut parts,
+                        &api,
+                    )
+                    .await
+                    {
+                        ::std::result::Result::Ok(v) => v,
+                        ::std::result::Result::Err(rej) => {
+                            return ::axum::response::IntoResponse::into_response(rej);
+                        }
+                    };
+                });
+            } else {
+                extractors.push(quote! { __headers: ::axum::http::HeaderMap });
+            }
             for p in &header_params {
                 let wire = p.name.as_str();
                 let ident = server_param_ident(p);
@@ -552,20 +628,62 @@ impl<'a> ServerCodegen<'a> {
 
         // Body
         let body_ty_opt = body_type(op);
-        if let Some(body_ty) = &body_ty_opt {
+        let body_bind = if let Some(body_ty) = &body_ty_opt {
             let body_ty_tokens = parse_type(body_ty);
             if op.request_body_required {
-                extractors.push(quote! {
-                    ::axum::Json(body): ::axum::Json<#body_ty_tokens>
-                });
                 call_args.push(quote! { body });
+                if context_extensions {
+                    Some(quote! {
+                        let req = ::axum::http::Request::from_parts(parts, body);
+                        let ::axum::Json(body) = match <::axum::Json<#body_ty_tokens> as ::axum::extract::FromRequest<T>>::from_request(
+                            req,
+                            &api,
+                        )
+                        .await
+                        {
+                            ::std::result::Result::Ok(v) => v,
+                            ::std::result::Result::Err(rej) => {
+                                return ::axum::response::IntoResponse::into_response(rej);
+                            }
+                        };
+                    })
+                } else {
+                    extractors.push(quote! {
+                        ::axum::Json(body): ::axum::Json<#body_ty_tokens>
+                    });
+                    None
+                }
             } else {
-                extractors.push(quote! {
-                    body: ::std::option::Option<::axum::Json<#body_ty_tokens>>
-                });
                 call_args.push(quote! { body.map(|::axum::Json(b)| b) });
+                if context_extensions {
+                    Some(quote! {
+                        let req = ::axum::http::Request::from_parts(parts, body);
+                        let body = match <::std::option::Option<::axum::Json<#body_ty_tokens>> as ::axum::extract::FromRequest<T>>::from_request(
+                            req,
+                            &api,
+                        )
+                        .await
+                        {
+                            ::std::result::Result::Ok(v) => v,
+                            ::std::result::Result::Err(rej) => {
+                                return ::axum::response::IntoResponse::into_response(rej);
+                            }
+                        };
+                    })
+                } else {
+                    extractors.push(quote! {
+                        body: ::std::option::Option<::axum::Json<#body_ty_tokens>>
+                    });
+                    None
+                }
             }
-        }
+        } else if context_extensions {
+            Some(quote! {
+                let _ = (parts, body);
+            })
+        } else {
+            None
+        };
 
         let _ = format_ident!("{}Response", op.operation_id.to_pascal_case());
         // Keep referencing trait_ident so the where-bound name is
@@ -577,18 +695,41 @@ impl<'a> ServerCodegen<'a> {
         // param short-circuit (400 BadRequest) and the trait method's
         // typed response enum (via IntoResponse) can both flow out
         // through the same return type.
-        quote! {
-            async fn #handler_ident<T>(
-                #(#extractors),*
-            ) -> ::axum::response::Response
-            where
-                T: super::api::#trait_ident + Clone + Send + Sync + 'static,
-            {
-                #(#required_query_checks)*
-                #(#required_header_checks)*
-                ::axum::response::IntoResponse::into_response(
-                    api.#trait_method(#(#call_args),*).await,
-                )
+        if context_extensions {
+            let body_bind = body_bind.unwrap_or_else(|| quote! {});
+            quote! {
+                async fn #handler_ident<T>(
+                    ::axum::extract::State(api): ::axum::extract::State<T>,
+                    req: ::axum::extract::Request,
+                ) -> ::axum::response::Response
+                where
+                    T: super::api::#trait_ident + Clone + Send + Sync + 'static,
+                {
+                    let (mut parts, body) = req.into_parts();
+                    let ctx = RequestContext(parts.extensions.clone());
+                    #(#parts_binds)*
+                    #body_bind
+                    #(#required_query_checks)*
+                    #(#required_header_checks)*
+                    ::axum::response::IntoResponse::into_response(
+                        api.#trait_method(#(#call_args),*).await,
+                    )
+                }
+            }
+        } else {
+            quote! {
+                async fn #handler_ident<T>(
+                    #(#extractors),*
+                ) -> ::axum::response::Response
+                where
+                    T: super::api::#trait_ident + Clone + Send + Sync + 'static,
+                {
+                    #(#required_query_checks)*
+                    #(#required_header_checks)*
+                    ::axum::response::IntoResponse::into_response(
+                        api.#trait_method(#(#call_args),*).await,
+                    )
+                }
             }
         }
     }
@@ -617,6 +758,34 @@ impl<'a> ServerCodegen<'a> {
             }
         }
 
+        let request_context = if self.server.context_extensions {
+            quote! {
+                /// Request-scoped context carrying middleware-settled state from
+                /// [`axum::http::Extensions`].
+                ///
+                /// Middleware layers (auth, tenancy, tracing, etc.) insert typed
+                /// values into the request extensions before the handler runs.
+                /// When `[server].context_extensions = true`, every generated
+                /// trait method receives a leading `ctx: RequestContext` built
+                /// by cloning those extensions out of the request parts before
+                /// body extraction.
+                #[derive(Clone)]
+                pub struct RequestContext(pub ::axum::http::Extensions);
+
+                impl RequestContext {
+                    /// Look up a value previously inserted into request extensions
+                    /// by middleware.
+                    pub fn get<T: ::std::clone::Clone + Send + Sync + 'static>(
+                        &self,
+                    ) -> ::std::option::Option<&T> {
+                        self.0.get::<T>()
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             //! Per-tag traits. Implement one of these on your own
             //! struct; the router (P5) wires it into axum.
@@ -630,6 +799,8 @@ impl<'a> ServerCodegen<'a> {
             // how the user mounts the generated tree.
             #[allow(unused_imports)]
             use super::super::types::*;
+
+            #request_context
 
             #(#param_enums)*
 
@@ -654,11 +825,14 @@ impl<'a> ServerCodegen<'a> {
         let name = format_ident!("{}", op.operation_id.to_snake_case());
         let response_ty = format_ident!("{}Response", op.operation_id.to_pascal_case());
 
-        // Order: path → query → header → body. Required params keep
+        // Order: [ctx] → path → query → header → body. Required params keep
         // their declared rust_type; optional params wrap in Option<…>.
         // This mirrors what the router handler extracts so positional
         // ordering matches the call site exactly.
         let mut params: Vec<TokenStream> = Vec::new();
+        if self.server.context_extensions {
+            params.push(quote! { ctx: RequestContext });
+        }
         for p in &op.parameters {
             if p.location == "path" {
                 let ident = server_param_ident(p);

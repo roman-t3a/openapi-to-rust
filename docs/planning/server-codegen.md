@@ -50,6 +50,10 @@ operations = [
   "createChatCompletion",
   "tag:Embeddings",
 ]
+# Optional. When true, every trait method gains a leading
+# `ctx: RequestContext` built from request Extensions so
+# middleware-settled state is available to handlers.
+# context_extensions = true
 ```
 
 Section absent or list empty ⇒ no server emission.

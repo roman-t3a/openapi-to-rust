@@ -236,6 +236,14 @@ pub struct ServerSection {
     /// emitted surface dramatically (often 100× for spec-heavy APIs).
     #[serde(default)]
     pub prune_models: bool,
+    /// When true, every generated server trait method gains a leading
+    /// `ctx: RequestContext` parameter. Handlers construct it by cloning
+    /// `http::Extensions` out of the request parts before body extraction,
+    /// so middleware-settled state (auth, tenancy, etc.) is available to
+    /// product handlers without ambient task-locals. Default false —
+    /// output is byte-identical to pre-0.5.4 when unset.
+    #[serde(default)]
+    pub context_extensions: bool,
 }
 
 impl ServerSection {

@@ -106,6 +106,7 @@ fn generated_server_files()
             framework: "axum".to_string(),
             operations: vec!["createEntity".to_string()],
             prune_models: false,
+            context_extensions: false,
         }),
         ..Default::default()
     };
@@ -203,6 +204,7 @@ fn server_generation_advises_framework_dependencies() -> Result<(), Box<dyn std:
             framework: "axum".to_string(),
             operations: vec!["createEntity".to_string()],
             prune_models: false,
+            context_extensions: false,
         }),
         ..Default::default()
     };
