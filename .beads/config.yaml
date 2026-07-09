@@ -53,4 +53,4 @@
 # - github.org
 # - github.repo
 
-sync.remote: "git+ssh://git@github.com/gpu-cli/openapi-to-rust.git"
+sync.remote: "git+https://github.com/roman-t3a/openapi-to-rust.git"
