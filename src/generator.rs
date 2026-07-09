@@ -1,4 +1,7 @@
-use crate::{GeneratorError, Result, analysis::SchemaAnalysis, streaming::StreamingConfig};
+use crate::{
+    GeneratorError, Result, analysis::SchemaAnalysis, streaming::StreamingConfig,
+    type_mapping::DepRequirement,
+};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::BTreeMap;
@@ -203,13 +206,10 @@ pub struct GenerationResult {
     pub files: Vec<GeneratedFile>,
     /// Generated mod.rs content that exports all modules
     pub mod_file: GeneratedFile,
-    /// Optional crates the generated code references (chrono, uuid,
-    /// url, …) — populated from the analyzer's TypeMapper
-    /// used-features set. The CLI uses this to write
-    /// `REQUIRED_DEPS.toml` next to the generated module and to
-    /// print a stderr summary so users know exactly what to add to
-    /// their `Cargo.toml`. Empty when no typed-scalar crates were
-    /// referenced.
+    /// Crates the generated code references beyond `std`. The CLI
+    /// uses this to write `REQUIRED_DEPS.toml` next to the generated
+    /// module and to print a stderr summary so users know exactly
+    /// what to add to their `Cargo.toml`.
     pub required_deps: Vec<crate::type_mapping::DepRequirement>,
 }
 
@@ -275,11 +275,14 @@ impl CodeGenerator {
             content: mod_content,
         };
 
-        // Snapshot the optional crates the analyzer's TypeMapper
-        // touched. Q2.8 surfaces these via REQUIRED_DEPS.toml
-        // (written by `write_files`) and a CLI stderr summary.
-        let required_deps =
+        // Snapshot crates referenced by generated output. Q2.8
+        // surfaces these via REQUIRED_DEPS.toml (written by
+        // `write_files`) and a CLI stderr summary.
+        let mut required_deps =
             crate::type_mapping::collect_dep_requirements(&analysis.used_type_features);
+        required_deps.extend(self.server_dep_requirements());
+        required_deps.sort_by_key(|d| d.crate_name);
+        required_deps.dedup_by_key(|d| d.crate_name);
 
         Ok(GenerationResult {
             files,
@@ -291,6 +294,24 @@ impl CodeGenerator {
     /// Generate just the types (legacy single-file interface)
     pub fn generate(&self, analysis: &mut SchemaAnalysis) -> Result<String> {
         self.generate_types(analysis)
+    }
+
+    fn server_dep_requirements(&self) -> Vec<DepRequirement> {
+        if self
+            .config
+            .server
+            .as_ref()
+            .is_none_or(|server| server.operations.is_empty())
+        {
+            return Vec::new();
+        }
+
+        vec![
+            DepRequirement::new("async-trait", "0.1"),
+            DepRequirement::new("axum", "0.8"),
+            DepRequirement::new("serde", "1").with_features(&["derive"]),
+            DepRequirement::new("serde_json", "1"),
+        ]
     }
 
     /// Generate the types.rs file content

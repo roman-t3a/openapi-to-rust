@@ -765,6 +765,7 @@ pub struct SchemaAnalyzer {
     openapi_spec: Value,
     current_schema_name: Option<String>,
     component_parameters: BTreeMap<String, crate::openapi::Parameter>,
+    component_responses: BTreeMap<String, crate::openapi::Response>,
     /// Single chokepoint for `(openapi_type, format)` → Rust-type
     /// decisions (Q2.0). Defaulted when the analyzer is built without a
     /// config; threaded from `GeneratorConfig.types` via
@@ -794,6 +795,12 @@ impl SchemaAnalyzer {
             .and_then(|c| c.parameters.as_ref())
             .cloned()
             .unwrap_or_default();
+        let component_responses = spec
+            .components
+            .as_ref()
+            .and_then(|c| c.responses.as_ref())
+            .cloned()
+            .unwrap_or_default();
 
         Ok(Self {
             schemas,
@@ -801,6 +808,7 @@ impl SchemaAnalyzer {
             openapi_spec,
             current_schema_name: None,
             component_parameters,
+            component_responses,
             type_mapper,
         })
     }
@@ -4271,6 +4279,7 @@ impl SchemaAnalyzer {
         // Extract response schemas
         if let Some(responses) = &operation.responses {
             for (status_code, response) in responses {
+                let response = self.resolve_response(response).into_owned();
                 // T15: SSE auto-detection. If any response declares
                 // `text/event-stream`, mark the operation as streaming. The
                 // user can still override via config; here we lift the spec
@@ -4500,6 +4509,24 @@ impl SchemaAnalyzer {
             }
         }
         std::borrow::Cow::Borrowed(param)
+    }
+
+    /// Resolve a response reference (`#/components/responses/...`) to the
+    /// reusable response object. Without this, spec-first server generation
+    /// silently drops typed response variants for common shared error
+    /// envelopes.
+    fn resolve_response<'a>(
+        &'a self,
+        response: &'a crate::openapi::Response,
+    ) -> std::borrow::Cow<'a, crate::openapi::Response> {
+        if let Some(ref_str) = response.reference.as_deref() {
+            if let Some(response_name) = ref_str.strip_prefix("#/components/responses/") {
+                if let Some(resolved) = self.component_responses.get(response_name) {
+                    return std::borrow::Cow::Borrowed(resolved);
+                }
+            }
+        }
+        std::borrow::Cow::Borrowed(response)
     }
 
     /// Analyze a parameter.

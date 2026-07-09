@@ -447,10 +447,8 @@ impl<'a> ServerCodegen<'a> {
             .filter(|p| p.location == "path")
             .collect();
         if !path_params.is_empty() {
-            let idents: Vec<syn::Ident> = path_params
-                .iter()
-                .map(|p| format_ident!("{}", p.name.to_snake_case()))
-                .collect();
+            let idents: Vec<syn::Ident> =
+                path_params.iter().map(|p| server_param_ident(p)).collect();
             let types: Vec<TokenStream> = path_params
                 .iter()
                 .map(|p| parse_type(&p.rust_type))
@@ -483,7 +481,7 @@ impl<'a> ServerCodegen<'a> {
                 ::axum::extract::Query(__q): ::axum::extract::Query<#query_ident>
             });
             for p in &query_params {
-                let f = format_ident!("{}", p.name.to_snake_case());
+                let f = server_param_ident(p);
                 let wire = p.name.as_str();
                 if p.required {
                     let missing_msg = format!("missing required query parameter `{wire}`");
@@ -520,7 +518,7 @@ impl<'a> ServerCodegen<'a> {
             extractors.push(quote! { __headers: ::axum::http::HeaderMap });
             for p in &header_params {
                 let wire = p.name.as_str();
-                let ident = format_ident!("{}", header_param_ident(&p.name));
+                let ident = server_param_ident(p);
                 if p.required {
                     let missing_msg = format!("missing required header `{wire}`");
                     required_header_checks.push(quote! {
@@ -645,7 +643,7 @@ impl<'a> ServerCodegen<'a> {
         let doc = format!(" Operations under the `{tag}` tag.");
         quote! {
             #[doc = #doc]
-            #[axum::async_trait]
+            #[async_trait::async_trait]
             pub trait #trait_ident: Send + Sync + 'static {
                 #(#methods)*
             }
@@ -663,14 +661,14 @@ impl<'a> ServerCodegen<'a> {
         let mut params: Vec<TokenStream> = Vec::new();
         for p in &op.parameters {
             if p.location == "path" {
-                let ident = format_ident!("{}", p.name.to_snake_case());
+                let ident = server_param_ident(p);
                 let ty = parse_type(&p.rust_type);
                 params.push(quote! { #ident: #ty });
             }
         }
         for p in &op.parameters {
             if p.location == "query" {
-                let ident = format_ident!("{}", p.name.to_snake_case());
+                let ident = server_param_ident(p);
                 let ty = parse_type(&p.rust_type);
                 // Required query params land as `T`; the handler
                 // validates presence and returns 400 if absent, so
@@ -685,7 +683,7 @@ impl<'a> ServerCodegen<'a> {
         }
         for p in &op.parameters {
             if p.location == "header" {
-                let ident = format_ident!("{}", header_param_ident(&p.name));
+                let ident = server_param_ident(p);
                 if p.required {
                     params.push(quote! { #ident: String });
                 } else {
@@ -732,7 +730,7 @@ impl<'a> ServerCodegen<'a> {
         let fields: Vec<TokenStream> = query_params
             .iter()
             .map(|p| {
-                let f_ident = format_ident!("{}", p.name.to_snake_case());
+                let f_ident = server_param_ident(p);
                 let ty = parse_type(&p.rust_type);
                 let serde_rename = if p.name.to_snake_case() == p.name {
                     quote! {}
@@ -899,11 +897,52 @@ impl<'a> ServerCodegen<'a> {
     }
 }
 
-/// Convert a wire-level header name (e.g. `anthropic-version`,
-/// `X-Request-Id`) to a Rust identifier (`anthropic_version`,
-/// `x_request_id`). Snake_case lowercases + replaces hyphens.
-fn header_param_ident(name: &str) -> String {
-    name.replace('-', "_").to_snake_case()
+/// Convert an operation parameter to the exact Rust identifier emitted in
+/// generated server traits, routers, and query structs.
+///
+/// The analyzer assigns a per-operation `rust_ident` that deduplicates wire
+/// names which collapse to the same snake_case binding. The server generator
+/// must reuse it and apply keyword escaping, otherwise query/path/header names
+/// like `type` or `ref` produce invalid Rust while the client generator
+/// succeeds.
+fn server_param_ident(param: &crate::analysis::ParameterInfo) -> syn::Ident {
+    format_ident!("{}", server_param_ident_str(param))
+}
+
+fn server_param_ident_str(param: &crate::analysis::ParameterInfo) -> String {
+    if let Some(ident) = &param.rust_ident {
+        return escape_keyword_ident(ident);
+    }
+    escape_keyword_ident(&base_server_param_ident(&param.name))
+}
+
+fn base_server_param_ident(name: &str) -> String {
+    let suffix = if name.ends_with("<=") {
+        "_lte"
+    } else if name.ends_with(">=") {
+        "_gte"
+    } else if name.ends_with('<') {
+        "_lt"
+    } else if name.ends_with('>') {
+        "_gt"
+    } else {
+        ""
+    };
+    let stripped = name.trim_end_matches(['<', '>', '=']);
+    let mut snake = stripped.to_snake_case();
+    snake.push_str(suffix);
+    snake
+}
+
+fn escape_keyword_ident(snake_case: &str) -> String {
+    if matches!(snake_case, "self" | "super" | "crate" | "Self") {
+        return format!("{snake_case}_param");
+    }
+    if crate::generator::CodeGenerator::is_rust_keyword(snake_case) {
+        format!("r#{snake_case}")
+    } else {
+        snake_case.to_string()
+    }
 }
 
 /// Emit a string-enum type for a parameter whose inline schema

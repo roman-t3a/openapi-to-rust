@@ -31,7 +31,7 @@ use std::convert::Infallible;
 #[derive(Clone)]
 struct AppState;
 
-#[axum::async_trait]
+#[async_trait::async_trait]
 impl ResponsesApi for AppState {
     async fn create_response(&self, body: CreateResponse) -> CreateResponseResponse {
         if body.stream == Some(true) {
@@ -111,7 +111,7 @@ fn sse_event(name: &str, data: &str) -> Result<Event, Infallible> {
     Ok(Event::default().event(name).data(data))
 }
 
-#[axum::async_trait]
+#[async_trait::async_trait]
 impl UsageApi for AppState {
     /// `start_time` is `i64` (not `Option`) — the generated handler
     /// short-circuits with 400 if the client omits it, so by the

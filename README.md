@@ -129,7 +129,7 @@ use futures_util::stream;
 #[derive(Clone)]
 struct AppState;
 
-#[axum::async_trait]
+#[async_trait::async_trait]
 impl ResponsesApi for AppState {
     async fn create_response(&self, body: CreateResponse) -> CreateResponseResponse {
         if body.stream == Some(true) {
@@ -172,7 +172,7 @@ Two complete examples are in the repo:
 | `server/errors.rs` | `enum <Op>Response { Ok(T), BadRequest(E), …, OkStream(Sse<…>) }` with `IntoResponse` |
 | `server/router.rs` | Per-tag `Router` factory; combined `build_router<…>(…)` for multi-tag selections |
 | `mod.rs` | Module declarations + re-exports |
-| `REQUIRED_DEPS.toml` | Optional crates the generated code references (chrono, uuid, url, bytes, base64) — copy into your consuming crate's `Cargo.toml` |
+| `REQUIRED_DEPS.toml` | Crates the generated code references — copy into your consuming crate's `Cargo.toml`. Server scaffolding lists `axum`, `serde`, `serde_json`, and `async-trait`; streaming server variants also expect `futures-core`. |
 
 ### Generated client usage
 
@@ -552,6 +552,15 @@ cargo run --manifest-path examples/server-anthropic-messages/Cargo.toml
 ```
 
 ## Release notes
+
+### 0.5.2
+
+**Server codegen hardening**
+- Axum server traits now emit `#[async_trait::async_trait]` instead of `#[axum::async_trait]`, so generated server code works with axum 0.8 where the macro is no longer re-exported.
+- Server-side path, query, and header parameters now reuse the analyzer's deduplicated, keyword-safe Rust identifiers. Query parameters named `type`, `ref`, etc. compile as raw identifiers such as `r#type`, matching the existing client-side behavior.
+- Operation responses that `$ref` reusable `#/components/responses/*` objects now resolve before response enum generation, so shared public error envelopes and success responses are not silently dropped from generated server response enums.
+- `REQUIRED_DEPS.toml` now includes the framework crates required by generated server scaffolding (`axum`, `async-trait`, `serde`, and `serde_json`).
+- The end-to-end axum server examples were moved to axum 0.8 and `async-trait`.
 
 ### 0.5 (this release)
 

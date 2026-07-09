@@ -308,16 +308,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Q2.8 dep advisory: surface optional crates the
-            // generated code references so the operator knows what
-            // to add to their Cargo.toml. write_files already
-            // dropped a copy-pasteable REQUIRED_DEPS.toml next to
-            // the generated module; the stderr summary makes it
-            // discoverable without scanning the output dir.
+            // Q2.8 dep advisory: surface crates the generated code
+            // references so the operator knows what to add to their
+            // Cargo.toml. write_files already dropped a copy-pasteable
+            // REQUIRED_DEPS.toml next to the generated module; the
+            // stderr summary makes it discoverable without scanning
+            // the output dir.
             if !result.required_deps.is_empty() {
                 eprintln!();
                 eprintln!(
-                    "📦 Generated code uses {} optional crate(s). Add to your Cargo.toml:",
+                    "📦 Generated code uses {} crate(s). Add to your Cargo.toml:",
                     result.required_deps.len()
                 );
                 eprintln!();
@@ -646,7 +646,7 @@ fn print_server_hint(
     eprintln!("   #[derive(Clone)]");
     eprintln!("   pub struct AppState {{ /* state goes here */ }}");
     eprintln!();
-    eprintln!("   #[axum::async_trait]");
+    eprintln!("   #[async_trait::async_trait]");
     eprintln!("   impl {trait_name} for AppState {{");
     eprintln!("       async fn {method}(&self{body_param}) -> {response_ty} {{");
     eprintln!("           todo!()");

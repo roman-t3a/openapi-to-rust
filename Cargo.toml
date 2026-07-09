@@ -1,13 +1,13 @@
 [package]
 name = "openapi-to-rust"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["James Lal"]
 license = "MIT"
 description = "Generate strongly-typed Rust structs, HTTP clients, and SSE streaming clients from OpenAPI 3.1 specifications"
-repository = "https://github.com/gpu-cli/openapi-to-rust"
-homepage = "https://github.com/gpu-cli/openapi-to-rust"
+repository = "https://github.com/roman-t3a/openapi-to-rust"
+homepage = "https://github.com/roman-t3a/openapi-to-rust"
 keywords = ["openapi", "codegen", "rust", "sse", "api-client"]
 categories = ["development-tools", "web-programming"]
 readme = "README.md"
