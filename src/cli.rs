@@ -249,18 +249,31 @@ pub async fn run_generation_cli(cli_config: CliConfig) {
 
 async fn load_spec(input: &str, verbose: bool) -> Result<String, Box<dyn std::error::Error>> {
     if input.starts_with("http://") || input.starts_with("https://") {
-        // Load from URL
-        if verbose {
-            println!("🌐 Fetching from URL...");
-        }
+        #[cfg(feature = "fetch")]
+        {
+            // Load from URL (requires the optional `fetch` feature / reqwest).
+            if verbose {
+                println!("🌐 Fetching from URL...");
+            }
 
-        let response = reqwest::get(input).await?;
-        if !response.status().is_success() {
-            return Err(format!("HTTP error: {}", response.status()).into());
-        }
+            let response = reqwest::get(input).await?;
+            if !response.status().is_success() {
+                return Err(format!("HTTP error: {}", response.status()).into());
+            }
 
-        let content = response.text().await?;
-        Ok(content)
+            let content = response.text().await?;
+            Ok(content)
+        }
+        #[cfg(not(feature = "fetch"))]
+        {
+            let _ = verbose;
+            Err(
+                "Remote OpenAPI URL loading requires the `fetch` cargo feature \
+                 (enable with `--features fetch`). Default builds stay free of \
+                 reqwest / native-tls for library consumers."
+                    .into(),
+            )
+        }
     } else {
         // Load from file
         if verbose {
@@ -303,12 +316,13 @@ fn parse_spec(content: &str, input: &str) -> Result<serde_json::Value, Box<dyn s
 }
 
 /// Parse YAML to serde_json::Value, converting large numbers to f64 to avoid overflow.
-/// serde_yaml 0.9 cannot represent integers exceeding i64/u64 range (e.g. numbers > 2^64),
-/// so we preprocess the YAML to convert such numbers to float notation, then go through
-/// serde_yaml::Value and convert to serde_json::Value manually.
+/// serde_yaml_ng (like archived serde_yaml 0.9) cannot represent integers exceeding
+/// i64/u64 range (e.g. numbers > 2^64), so we preprocess the YAML to convert such
+/// numbers to float notation, then go through serde_yaml_ng::Value and convert to
+/// serde_json::Value manually.
 pub fn yaml_to_json_value(content: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let preprocessed = sanitize_large_yaml_integers(content);
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&preprocessed)?;
+    let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&preprocessed)?;
     Ok(yaml_value_to_json(yaml_value))
 }
 
@@ -321,7 +335,7 @@ pub fn json_from_str_lossy(content: &str) -> Result<serde_json::Value, Box<dyn s
             let err_msg = e.to_string();
             if err_msg.contains("number out of range") {
                 // Fall back: parse via YAML which handles large numbers
-                let yaml_value: serde_yaml::Value = serde_yaml::from_str(content)?;
+                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(content)?;
                 Ok(yaml_value_to_json(yaml_value))
             } else {
                 Err(e.into())
@@ -330,11 +344,11 @@ pub fn json_from_str_lossy(content: &str) -> Result<serde_json::Value, Box<dyn s
     }
 }
 
-fn yaml_value_to_json(yaml: serde_yaml::Value) -> serde_json::Value {
+fn yaml_value_to_json(yaml: serde_yaml_ng::Value) -> serde_json::Value {
     match yaml {
-        serde_yaml::Value::Null => serde_json::Value::Null,
-        serde_yaml::Value::Bool(b) => serde_json::Value::Bool(b),
-        serde_yaml::Value::Number(n) => {
+        serde_yaml_ng::Value::Null => serde_json::Value::Null,
+        serde_yaml_ng::Value::Bool(b) => serde_json::Value::Bool(b),
+        serde_yaml_ng::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 serde_json::Value::Number(i.into())
             } else if let Some(u) = n.as_u64() {
@@ -346,18 +360,18 @@ fn yaml_value_to_json(yaml: serde_yaml::Value) -> serde_json::Value {
                 serde_json::json!(0.0)
             }
         }
-        serde_yaml::Value::String(s) => serde_json::Value::String(s),
-        serde_yaml::Value::Sequence(seq) => {
+        serde_yaml_ng::Value::String(s) => serde_json::Value::String(s),
+        serde_yaml_ng::Value::Sequence(seq) => {
             serde_json::Value::Array(seq.into_iter().map(yaml_value_to_json).collect())
         }
-        serde_yaml::Value::Mapping(map) => {
+        serde_yaml_ng::Value::Mapping(map) => {
             let obj = map
                 .into_iter()
                 .filter_map(|(k, v)| {
                     let key = match k {
-                        serde_yaml::Value::String(s) => s,
-                        serde_yaml::Value::Number(n) => n.to_string(),
-                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        serde_yaml_ng::Value::String(s) => s,
+                        serde_yaml_ng::Value::Number(n) => n.to_string(),
+                        serde_yaml_ng::Value::Bool(b) => b.to_string(),
                         _ => return None,
                     };
                     Some((key, yaml_value_to_json(v)))
@@ -365,12 +379,12 @@ fn yaml_value_to_json(yaml: serde_yaml::Value) -> serde_json::Value {
                 .collect();
             serde_json::Value::Object(obj)
         }
-        serde_yaml::Value::Tagged(tagged) => yaml_value_to_json(tagged.value),
+        serde_yaml_ng::Value::Tagged(tagged) => yaml_value_to_json(tagged.value),
     }
 }
 
 /// Preprocess YAML content to convert integers that exceed i64/u64 range to float notation.
-/// serde_yaml 0.9 cannot parse integers larger than u64::MAX or smaller than i64::MIN,
+/// serde_yaml_ng cannot parse integers larger than u64::MAX or smaller than i64::MIN,
 /// so we find bare integer values on YAML lines and append `.0` if they overflow.
 fn sanitize_large_yaml_integers(content: &str) -> String {
     let mut result = String::with_capacity(content.len());

@@ -138,7 +138,7 @@ fn test_all_fixtures_compile() {
             let spec: serde_json::Value = match extension {
                 Some("json") => serde_json::from_str(&content)
                     .unwrap_or_else(|_| panic!("Failed to parse JSON fixture: {path:?}")),
-                Some("yaml") | Some("yml") => serde_yaml::from_str(&content)
+                Some("yaml") | Some("yml") => serde_yaml_ng::from_str(&content)
                     .unwrap_or_else(|_| panic!("Failed to parse YAML fixture: {path:?}")),
                 _ => unreachable!(),
             };
@@ -201,7 +201,7 @@ fn test_anthropic_fixture() {
         let content = fs::read_to_string(&anthropic_path).expect("Failed to read anthropic.yml");
 
         let spec: serde_json::Value =
-            serde_yaml::from_str(&content).expect("Failed to parse anthropic.yml");
+            serde_yaml_ng::from_str(&content).expect("Failed to parse anthropic.yml");
 
         test_fixture_compiles("anthropic", spec).expect("Anthropic fixture should compile");
     } else {

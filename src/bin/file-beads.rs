@@ -40,7 +40,7 @@ struct Epic {
 struct Bead {
     id: String,
     title: String,
-    phase: serde_yaml::Value,
+    phase: serde_yaml_ng::Value,
     area: String,
     files: Vec<String>,
     depends_on: Vec<String>,
@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = workspace.join("tests/conformance/beads.yaml");
     let body = fs::read_to_string(&path)?;
-    let beads: Beads = serde_yaml::from_str(&body)?;
+    let beads: Beads = serde_yaml_ng::from_str(&body)?;
 
     println!(
         "repo: {} ({} labels, {} epics, {} beads)",
@@ -170,10 +170,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn phase_string(v: &serde_yaml::Value) -> String {
+fn phase_string(v: &serde_yaml_ng::Value) -> String {
     match v {
-        serde_yaml::Value::Number(n) => n.to_string(),
-        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml_ng::Value::Number(n) => n.to_string(),
+        serde_yaml_ng::Value::String(s) => s.clone(),
         _ => "?".to_string(),
     }
 }

@@ -1,0 +1,63 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "allOf if/then conditional required (CreateBankDetails minimized repro)",
+    "version": "1.0.0"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "BankAccountType": {
+        "type": "string",
+        "enum": ["iban", "account_number"]
+      },
+      "BankRoutingType": {
+        "type": "string",
+        "enum": ["aba", "swift_bic", "bsb"]
+      },
+      "BankDetailsRole": {
+        "type": "string",
+        "enum": ["primary", "correspondent"]
+      },
+      "CreateBankDetails": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "bank_country",
+          "account_number",
+          "account_type",
+          "bank_name",
+          "bank_address"
+        ],
+        "description": "Entity payout bank to register. routing_type + routing_code are required unless account_type is iban.",
+        "properties": {
+          "role": { "$ref": "#/components/schemas/BankDetailsRole" },
+          "account_holder_name": { "type": "string" },
+          "bank_country": { "type": "string" },
+          "account_number": { "type": "string" },
+          "account_type": { "$ref": "#/components/schemas/BankAccountType" },
+          "routing_type": { "$ref": "#/components/schemas/BankRoutingType" },
+          "routing_code": { "type": "string" },
+          "bank_name": { "type": "string" },
+          "bank_address": { "type": "string" }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["account_type"],
+              "properties": {
+                "account_type": {
+                  "not": { "const": "iban" }
+                }
+              }
+            },
+            "then": {
+              "required": ["routing_type", "routing_code"]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

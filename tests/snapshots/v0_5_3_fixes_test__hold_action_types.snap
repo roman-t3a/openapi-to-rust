@@ -1,0 +1,58 @@
+---
+source: tests/v0_5_3_fixes_test.rs
+expression: types
+---
+//! Generated types from OpenAPI specification
+//!
+//! This file contains all the generated types for the API.
+//! Do not edit manually - regenerate using the appropriate script.
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::format_in_format_args)]
+#![allow(clippy::let_unit_value)]
+#![allow(unreachable_patterns)]
+use serde::{Deserialize, Serialize};
+/**Resolve a hold: release or cancel. `split` is only valid with release.
+
+# Conditional requirements (if/then)
+
+These JSON Schema conditions are documented but NOT enforced by serde deserialization (merged struct fields stay optional unless unconditionally `required`):
+- if required=[type] properties={ type:const="cancel" } then properties={ split:false }*/
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HoldAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<Vec<HoldSplitLine>>,
+    pub r#type: HoldActionType,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HoldSplitLine {
+    pub account_id: String,
+    pub amount: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum HoldActionType {
+    #[default]
+    #[serde(rename = "release")]
+    Release,
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+impl HoldActionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+impl ::std::fmt::Display for HoldActionType {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl AsRef<str> for HoldActionType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}

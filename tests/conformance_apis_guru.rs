@@ -112,7 +112,7 @@ fn walk(root: &Path, out: &mut Vec<PathBuf>) {
 fn parse(body: &str, path: &Path) -> Result<OpenApiSpec, String> {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if ext == "yaml" {
-        serde_yaml::from_str(body).map_err(|e| e.to_string())
+        serde_yaml_ng::from_str(body).map_err(|e| e.to_string())
     } else {
         serde_json::from_str(body).map_err(|e| e.to_string())
     }

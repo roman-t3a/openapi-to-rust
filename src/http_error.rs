@@ -33,8 +33,8 @@
 //! # use openapi_to_rust::http_error::HttpError;
 //! fn handle_api_error(error: HttpError) {
 //!     match error {
-//!         HttpError::Network(e) => {
-//!             eprintln!("Network error: {}", e);
+//!         HttpError::Network(msg) => {
+//!             eprintln!("Network error: {}", msg);
 //!             // Will be retried automatically if retry is configured
 //!         }
 //!         HttpError::Http { status, message, .. } => {
@@ -120,9 +120,13 @@ use thiserror::Error;
 /// HTTP client errors that can occur during API requests
 #[derive(Error, Debug)]
 pub enum HttpError {
-    /// Network or connection error
+    /// Network or connection error.
+    ///
+    /// Stored as a string so this library crate does not depend on reqwest
+    /// (generated clients embed their own `HttpError` that wraps `reqwest::Error`
+    /// directly; this module is the shared helper surface for library users).
     #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(String),
 
     /// Request serialization error
     #[error("Failed to serialize request: {0}")]
@@ -199,6 +203,11 @@ impl HttpError {
             _ => false,
         }
     }
+
+    /// Create a network error from any displayable cause.
+    pub fn network_error(error: impl std::fmt::Display) -> Self {
+        Self::Network(error.to_string())
+    }
 }
 
 /// Result type for HTTP operations
@@ -212,10 +221,14 @@ pub type HttpResult<T> = Result<T, HttpError>;
 /// inspect what the server actually sent without having to hack the generated
 /// client. `typed` is `Some(_)` when the raw body was successfully parsed into a
 /// per-operation error type; `parse_error` records why parsing failed when not.
+///
+/// `headers` is a simple name→value map so the library crate does not depend on
+/// reqwest. Generated clients use `reqwest::header::HeaderMap` in their own
+/// emitted `ApiError` type.
 #[derive(Debug, Clone)]
 pub struct ApiError<E> {
     pub status: u16,
-    pub headers: reqwest::header::HeaderMap,
+    pub headers: std::collections::BTreeMap<String, String>,
     pub body: String,
     pub typed: Option<E>,
     pub parse_error: Option<String>,

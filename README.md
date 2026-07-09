@@ -553,6 +553,26 @@ cargo run --manifest-path examples/server-anthropic-messages/Cargo.toml
 
 ## Release notes
 
+### 0.5.3
+
+**Dependency modernization (library-consumer graph)**
+- Remote OpenAPI URL fetching is now an optional `fetch` cargo feature (off by default). The default library / build-dependency graph no longer pulls `reqwest`, and therefore no longer pulls `native-tls`, `openssl`, or `rustls-pemfile` (the latter carries an unmaintained RUSTSEC that fails cargo-deny in consumers).
+- When `fetch` is enabled, reqwest is 0.12 with `default-features = false` and `rustls-tls` only.
+- Direct `reqwest-middleware` / `reqwest-retry` library dependencies were removed (they were only referenced as tokens in generated client source; consumers of generated clients still declare them themselves).
+- Replaced archived `serde_yaml` with maintained `serde_yaml_ng`.
+- Library `HttpError::Network` is now a `String` (no reqwest type in the library API); generated clients still emit their own `HttpError` wrapping `reqwest::Error`.
+
+**allOf if/then conditional required**
+- Schemas that combine `type: object` with sibling `allOf: [{ if, then }]` (and top-level `if`/`then`/`else`) keep the merged struct.
+- Conditional `then.required` is **not** promoted into unconditional Rust required fields.
+- Dropped conditions are documented on the generated type under a "Conditional requirements (if/then)" rustdoc section, and analysis prints a generation-time warning listing each condition.
+- Chosen depth: merged struct + rustdoc + warning (not variant enums per condition). Full typed modeling of if/then would be a larger design; this is the clean floor that matches existing generator patterns.
+
+**Full-contract Schema parse gap**
+- Root cause: JSON Schema boolean schemas (`true` / `false`) were not modeled on the untagged `Schema` enum. Real hit: `HoldAction.then.properties.split: false` in a large customer contract (~216 schemas), which failed with `data did not match any variant of untagged enum Schema`.
+- Fix: `Schema::Boolean(bool)` plus handling in analysis/merge so boolean property schemas do not break parse or codegen.
+- Minimized golden fixtures under `tests/fixtures/v0_5_3/`.
+
 ### 0.5.2
 
 **Server codegen hardening**

@@ -169,7 +169,7 @@ fn test_generated_multi_response_client_compiles() {
 fn test_generated_anthropic_client_compiles() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/anthropic.yml");
     let raw = fs::read_to_string(&path).expect("read anthropic fixture");
-    let spec: serde_json::Value = serde_yaml::from_str(&raw).expect("parse anthropic fixture");
+    let spec: serde_json::Value = serde_yaml_ng::from_str(&raw).expect("parse anthropic fixture");
     let _temp = assert_generates_compiling_client("anthropic_client", spec);
 }
 

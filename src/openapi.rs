@@ -83,6 +83,12 @@ pub struct Components {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Schema {
+    /// JSON Schema boolean schema (`true` = accept any instance, `false` =
+    /// reject every instance). Valid anywhere a schema is expected
+    /// (e.g. `properties: { split: false }` to forbid a property under
+    /// `if`/`then`). Listed first so untagged deserialization matches
+    /// bare booleans before object variants.
+    Boolean(bool),
     /// Schema reference
     Reference {
         #[serde(rename = "$ref")]
@@ -271,6 +277,13 @@ pub struct SchemaDetails {
     #[serde(rename = "else")]
     pub else_schema: Option<Box<Schema>>,
     pub not: Option<Box<Schema>>,
+
+    /// Sibling `allOf` on a typed/untyped schema (e.g. `type: object` plus
+    /// `allOf: [{ if: …, then: … }]`). Pure-allOf schemas still match the
+    /// `Schema::AllOf` variant; this field captures the mixed form so
+    /// conditional branches are not silently dropped into `extra`.
+    #[serde(rename = "allOf", default)]
+    pub all_of: Option<Vec<Schema>>,
 
     // 3.0 deprecated annotations now first-class (kept since openai-responses fixture is OAS 3.0).
     pub title: Option<String>,
@@ -623,6 +636,7 @@ impl Schema {
     pub fn details(&self) -> &SchemaDetails {
         static EMPTY_DETAILS: Lazy<SchemaDetails> = Lazy::new(SchemaDetails::default);
         match self {
+            Schema::Boolean(_) => &EMPTY_DETAILS,
             Schema::Typed { details, .. } => details,
             Schema::TypedMulti { details, .. } => details,
             Schema::Reference { .. } | Schema::RecursiveRef { .. } | Schema::DynamicRef { .. } => {
@@ -638,6 +652,9 @@ impl Schema {
     /// Get mutable schema details
     pub fn details_mut(&mut self) -> &mut SchemaDetails {
         match self {
+            Schema::Boolean(_) => {
+                panic!("Cannot get mutable details for boolean schema")
+            }
             Schema::Typed { details, .. } => details,
             Schema::TypedMulti { details, .. } => details,
             Schema::Reference { .. } => {
@@ -751,6 +768,35 @@ impl Schema {
             }
             _ => None,
         }
+    }
+
+    /// True when this schema is a pure if/then/else conditional (no structural
+    /// properties of its own beyond the conditional keywords).
+    pub fn is_conditional_only(&self) -> bool {
+        if matches!(self, Schema::Boolean(_)) {
+            return false;
+        }
+        let details = self.details();
+        let has_if = details.if_schema.is_some();
+        if !has_if {
+            return false;
+        }
+        // Pure conditional: has `if`, and no independent object body beyond
+        // keywords that live on the conditional itself.
+        details.properties.is_none()
+            && details.required.is_none()
+            && details.items.is_none()
+            && details.enum_values.is_none()
+            && details.all_of.is_none()
+            && !matches!(
+                self,
+                Schema::AllOf { .. }
+                    | Schema::OneOf { .. }
+                    | Schema::AnyOf { .. }
+                    | Schema::Reference { .. }
+                    | Schema::RecursiveRef { .. }
+                    | Schema::DynamicRef { .. }
+            )
     }
 }
 

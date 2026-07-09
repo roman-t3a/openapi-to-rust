@@ -1386,12 +1386,25 @@ impl SchemaAnalyzer {
         schema_name: &str,
     ) -> Result<AnalyzedSchema> {
         let details = schema.details();
-        let description = details.description.clone();
+        let mut description = details.description.clone();
         // Combine 3.0-style `nullable: true` with 3.1's `type: ["X", "null"]`.
         let nullable = details.is_nullable() || schema.type_array_contains_null();
         let mut dependencies = HashSet::new();
 
         let schema_type = match schema {
+            Schema::Boolean(true) => SchemaType::Primitive {
+                rust_type: "serde_json::Value".to_string(),
+                serde_with: None,
+            },
+            Schema::Boolean(false) => {
+                // `false` schema rejects every instance; surface as unit-like
+                // opaque Value so the rest of generation can proceed. Callers
+                // almost never name a top-level `false` schema.
+                SchemaType::Primitive {
+                    rust_type: "serde_json::Value".to_string(),
+                    serde_with: None,
+                }
+            }
             Schema::Reference { reference, .. } => {
                 // For real-world refs we can't resolve to a known schema name
                 // (e.g. pagerduty's `#/components/parameters/foo/schema`),
@@ -1553,6 +1566,34 @@ impl SchemaAnalyzer {
             }
         };
 
+        // JSON Schema if/then/else (top-level or allOf sibling) is not lowered
+        // into Rust variant enums: the merged struct stays, and we surface the
+        // dropped conditions as rustdoc + a generation-time warning so callers
+        // know serde will not enforce them.
+        let conditional_notes = Self::collect_dropped_conditionals(schema);
+        if !conditional_notes.is_empty() {
+            for note in &conditional_notes {
+                eprintln!(
+                    "⚠️  {schema_name}: JSON Schema if/then not enforced in generated types: {note}"
+                );
+            }
+            let block = format!(
+                "\n\n# Conditional requirements (if/then)\n\n\
+                 These JSON Schema conditions are documented but NOT enforced by \
+                 serde deserialization (merged struct fields stay optional unless \
+                 unconditionally `required`):\n{}",
+                conditional_notes
+                    .iter()
+                    .map(|n| format!("- {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            description = Some(match description {
+                Some(d) => format!("{d}{block}"),
+                None => block.trim_start().to_string(),
+            });
+        }
+
         Ok(AnalyzedSchema {
             name: schema_name.to_string(),
             original: serde_json::to_value(schema).unwrap_or(Value::Null), // Convert back to Value for now
@@ -1562,6 +1603,131 @@ impl SchemaAnalyzer {
             description,
             default: details.default.clone(),
         })
+    }
+
+    /// Collect human-readable notes for if/then/else conditions that will not
+    /// be enforced in generated Rust types.
+    fn collect_dropped_conditionals(schema: &Schema) -> Vec<String> {
+        let mut notes = Vec::new();
+        if matches!(schema, Schema::Boolean(_)) {
+            return notes;
+        }
+
+        let details = schema.details();
+        if details.if_schema.is_some() {
+            notes.push(Self::format_if_then_note(details));
+        }
+
+        // Sibling allOf on typed/untyped schemas (type + allOf: [{if,then}]).
+        if let Some(all_of) = details.all_of.as_ref() {
+            for (i, branch) in all_of.iter().enumerate() {
+                notes.extend(Self::collect_dropped_conditionals_branch(branch, i));
+            }
+        }
+
+        // Pure Schema::AllOf composition.
+        if let Schema::AllOf { all_of, .. } = schema {
+            for (i, branch) in all_of.iter().enumerate() {
+                notes.extend(Self::collect_dropped_conditionals_branch(branch, i));
+            }
+        }
+
+        notes
+    }
+
+    fn collect_dropped_conditionals_branch(branch: &Schema, index: usize) -> Vec<String> {
+        let mut notes = Vec::new();
+        if matches!(branch, Schema::Boolean(_)) {
+            return notes;
+        }
+        let details = branch.details();
+        if details.if_schema.is_some() {
+            let mut note = Self::format_if_then_note(details);
+            note = format!("allOf[{index}]: {note}");
+            notes.push(note);
+        }
+        // Nested allOf is rare; one level of recursion covers real contracts.
+        if let Some(nested) = details.all_of.as_ref() {
+            for (j, inner) in nested.iter().enumerate() {
+                for mut n in Self::collect_dropped_conditionals_branch(inner, j) {
+                    n = format!("allOf[{index}].{n}");
+                    notes.push(n);
+                }
+            }
+        }
+        if let Schema::AllOf { all_of, .. } = branch {
+            for (j, inner) in all_of.iter().enumerate() {
+                for mut n in Self::collect_dropped_conditionals_branch(inner, j) {
+                    n = format!("allOf[{index}].{n}");
+                    notes.push(n);
+                }
+            }
+        }
+        notes
+    }
+
+    fn format_if_then_note(details: &crate::openapi::SchemaDetails) -> String {
+        let if_part = details
+            .if_schema
+            .as_ref()
+            .map(|s| Self::summarize_schema_for_note(s))
+            .unwrap_or_else(|| "true".to_string());
+        let then_part = details
+            .then_schema
+            .as_ref()
+            .map(|s| Self::summarize_schema_for_note(s))
+            .unwrap_or_else(|| "{}".to_string());
+        let else_part = details
+            .else_schema
+            .as_ref()
+            .map(|s| format!(" else {}", Self::summarize_schema_for_note(s)))
+            .unwrap_or_default();
+        format!("if {if_part} then {then_part}{else_part}")
+    }
+
+    /// Compact one-line summary of a schema for conditional notes / warnings.
+    fn summarize_schema_for_note(schema: &Schema) -> String {
+        match schema {
+            Schema::Boolean(b) => b.to_string(),
+            Schema::Reference { reference, .. } => format!("$ref:{reference}"),
+            _ => {
+                let d = schema.details();
+                let mut parts = Vec::new();
+                if let Some(req) = d.required.as_ref() {
+                    if !req.is_empty() {
+                        parts.push(format!("required=[{}]", req.join(", ")));
+                    }
+                }
+                if let Some(props) = d.properties.as_ref() {
+                    let mut prop_bits = Vec::new();
+                    for (name, prop) in props {
+                        prop_bits.push(format!("{name}:{}", Self::summarize_schema_for_note(prop)));
+                    }
+                    if !prop_bits.is_empty() {
+                        parts.push(format!("properties={{ {} }}", prop_bits.join(", ")));
+                    }
+                }
+                if let Some(c) = d.const_value.as_ref() {
+                    parts.push(format!("const={c}"));
+                }
+                if let Some(not) = d.not.as_ref() {
+                    parts.push(format!("not({})", Self::summarize_schema_for_note(not)));
+                }
+                if let Some(enums) = d.enum_values.as_ref() {
+                    let vals: Vec<String> = enums.iter().map(|v| v.to_string()).collect();
+                    parts.push(format!("enum=[{}]", vals.join(", ")));
+                }
+                if parts.is_empty() {
+                    if let Some(t) = schema.schema_type() {
+                        format!("type={t:?}")
+                    } else {
+                        "{}".to_string()
+                    }
+                } else {
+                    parts.join(" ")
+                }
+            }
+        }
     }
 
     fn analyze_object_schema(
@@ -1581,6 +1747,31 @@ impl SchemaAnalyzer {
 
         if let Some(props) = properties {
             for (prop_name, prop_schema) in props {
+                // JSON Schema boolean property schemas: `false` forbids the
+                // key, `true` accepts any value.
+                if matches!(prop_schema, Schema::Boolean(false)) {
+                    continue;
+                }
+                if matches!(prop_schema, Schema::Boolean(true)) {
+                    property_info.insert(
+                        prop_name.clone(),
+                        PropertyInfo {
+                            schema_type: SchemaType::Primitive {
+                                rust_type: "serde_json::Value".to_string(),
+                                serde_with: None,
+                            },
+                            nullable: false,
+                            description: Some(
+                                "JSON Schema boolean `true` schema (any value)".to_string(),
+                            ),
+                            default: None,
+                            serde_attrs: Vec::new(),
+                            constraints: PropertyConstraints::default(),
+                        },
+                    );
+                    continue;
+                }
+
                 // Check if this property is a union that needs a named type
                 let prop_type = if let Schema::AnyOf { any_of, .. } = prop_schema {
                     // First check if this should be a dynamic JSON pattern
@@ -1836,6 +2027,13 @@ impl SchemaAnalyzer {
         property_name: Option<&str>,
         dependencies: &mut HashSet<String>,
     ) -> Result<SchemaType> {
+        if matches!(schema, Schema::Boolean(_)) {
+            return Ok(SchemaType::Primitive {
+                rust_type: "serde_json::Value".to_string(),
+                serde_with: None,
+            });
+        }
+
         if let Some(ref_str) = self.get_any_reference(schema) {
             let target_opt = if ref_str == "#" {
                 Some(
@@ -2309,7 +2507,17 @@ impl SchemaAnalyzer {
         let current_context = self.current_schema_name.clone();
 
         for schema in all_of_schemas {
+            // Pure if/then branches contribute no unconditional properties/
+            // required; they are recorded as doc/warnings at the parent.
+            if schema.is_conditional_only() {
+                continue;
+            }
+
             match schema {
+                Schema::Boolean(_) => {
+                    // Boolean schemas in allOf: true is a no-op, false makes
+                    // the composition unsatisfiable. Skip both for merge.
+                }
                 Schema::Reference { reference, .. } => {
                     // Add dependency on referenced schema
                     if let Some(target) = self.extract_schema_name(reference) {
@@ -2425,11 +2633,40 @@ impl SchemaAnalyzer {
         merged_required: &mut HashSet<String>,
         dependencies: &mut HashSet<String>,
     ) -> Result<()> {
+        if matches!(schema, Schema::Boolean(_)) {
+            return Ok(());
+        }
         let details = schema.details();
 
         // Merge properties
         if let Some(properties) = &details.properties {
             for (prop_name, prop_schema) in properties {
+                // Boolean false property schema means "this property must not
+                // validate" (JSON Schema forbid). Skip emitting a field.
+                if matches!(prop_schema, Schema::Boolean(false)) {
+                    continue;
+                }
+                if matches!(prop_schema, Schema::Boolean(true)) {
+                    // Accept any value: model as open JSON.
+                    merged_properties.insert(
+                        prop_name.clone(),
+                        PropertyInfo {
+                            schema_type: SchemaType::Primitive {
+                                rust_type: "serde_json::Value".to_string(),
+                                serde_with: None,
+                            },
+                            nullable: false,
+                            description: Some(
+                                "JSON Schema boolean `true` schema (any value)".to_string(),
+                            ),
+                            default: None,
+                            serde_attrs: Vec::new(),
+                            constraints: PropertyConstraints::default(),
+                        },
+                    );
+                    continue;
+                }
+
                 let prop_type = self.analyze_property_schema_with_context(
                     prop_schema,
                     Some(prop_name),
@@ -2457,10 +2694,26 @@ impl SchemaAnalyzer {
             }
         }
 
-        // Merge required fields
+        // Merge required fields (unconditional only; then.required is never
+        // promoted into the merged set).
         if let Some(required) = &details.required {
             for field in required {
                 merged_required.insert(field.clone());
+            }
+        }
+
+        // Sibling allOf on a typed object: merge non-conditional branches.
+        if let Some(all_of) = details.all_of.as_ref() {
+            for branch in all_of {
+                if branch.is_conditional_only() || matches!(branch, Schema::Boolean(_)) {
+                    continue;
+                }
+                self.merge_schema_into_properties(
+                    branch,
+                    merged_properties,
+                    merged_required,
+                    dependencies,
+                )?;
             }
         }
 
@@ -3447,6 +3700,10 @@ impl SchemaAnalyzer {
         if let Some(items_schema) = &details.items {
             // Analyze the item type
             let item_type = match items_schema.as_ref() {
+                Schema::Boolean(_) => SchemaType::Primitive {
+                    rust_type: "serde_json::Value".to_string(),
+                    serde_with: None,
+                },
                 Schema::Reference { reference, .. } => {
                     // Array of referenced types
                     let target = self

@@ -1,0 +1,50 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Boolean schema + if/then (HoldAction minimized repro)",
+    "version": "1.0.0"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "HoldSplitLine": {
+        "type": "object",
+        "required": ["account_id", "amount"],
+        "properties": {
+          "account_id": { "type": "string" },
+          "amount": { "type": "string" }
+        }
+      },
+      "HoldAction": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "description": "Resolve a hold: release or cancel. `split` is only valid with release.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["release", "cancel"]
+          },
+          "split": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/HoldSplitLine" }
+          },
+          "reason": {
+            "type": ["string", "null"]
+          }
+        },
+        "if": {
+          "properties": {
+            "type": { "const": "cancel" }
+          },
+          "required": ["type"]
+        },
+        "then": {
+          "properties": {
+            "split": false
+          }
+        }
+      }
+    }
+  }
+}
