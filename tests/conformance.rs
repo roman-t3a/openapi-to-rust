@@ -257,7 +257,7 @@ fn collect_extras(spec: &OpenApiSpec, out: &mut Vec<ExtraField>) {
 }
 
 fn push_extras(prefix: &str, extra: &BTreeMap<String, Value>, out: &mut Vec<ExtraField>) {
-    for (k, _) in extra {
+    for k in extra.keys() {
         if k.starts_with("x-") {
             continue;
         }

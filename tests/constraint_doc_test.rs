@@ -127,10 +127,12 @@ fn no_constraints_emits_no_constraint_doc_line() {
 
 #[test]
 fn mode_off_suppresses_doc_comment() {
-    let mut cfg = TypeMappingConfig::default();
-    cfg.constraints = Some(TypeConstraintsConfig {
-        mode: Some(ConstraintMode::Off),
-    });
+    let cfg = TypeMappingConfig {
+        constraints: Some(TypeConstraintsConfig {
+            mode: Some(ConstraintMode::Off),
+        }),
+        ..Default::default()
+    };
     let code = generate(
         spec_with_property(json!({
             "type": "integer",

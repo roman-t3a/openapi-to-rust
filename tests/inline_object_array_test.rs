@@ -7,7 +7,7 @@ use openapi_to_rust::test_helpers::*;
 use serde_json::json;
 
 #[test]
-fn test_inline_object_in_array_simple() {
+fn test_inline_object_in_array_simple() -> Result<(), Box<dyn std::error::Error>> {
     // Simple test case with inline object in array
     let spec = json!({
         "openapi": "3.1.0",
@@ -37,7 +37,7 @@ fn test_inline_object_in_array_simple() {
         }
     });
 
-    let result = test_generation("inline_object_in_array_simple", spec).expect("Generation failed");
+    let result = test_generation("inline_object_in_array_simple", spec)?;
 
     // Assert that an item type was generated
     assert!(
@@ -56,10 +56,12 @@ fn test_inline_object_in_array_simple() {
         !result.contains("pub items: Vec<serde_json::Value>"),
         "Array should NOT fall back to serde_json::Value"
     );
+
+    Ok(())
 }
 
 #[test]
-fn test_chat_completion_stream_response_choices() {
+fn test_chat_completion_stream_response_choices() -> Result<(), Box<dyn std::error::Error>> {
     // Test case from OpenAI's chat completions API
     let spec = json!({
         "openapi": "3.1.0",
@@ -165,7 +167,7 @@ fn test_chat_completion_stream_response_choices() {
         }
     });
 
-    let result = test_generation("content_delta_test", spec).expect("Generation failed");
+    let result = test_generation("content_delta_test", spec)?;
 
     // Assert that the choices item type was generated
     assert!(
@@ -186,10 +188,12 @@ fn test_chat_completion_stream_response_choices() {
         !result.contains("pub choices: Vec<serde_json::Value>"),
         "Choices field should NOT fall back to serde_json::Value"
     );
+
+    Ok(())
 }
 
 #[test]
-fn test_nested_inline_objects_in_array() {
+fn test_nested_inline_objects_in_array() -> Result<(), Box<dyn std::error::Error>> {
     // Test case with nested inline objects
     let spec = json!({
         "openapi": "3.1.0",
@@ -229,7 +233,7 @@ fn test_nested_inline_objects_in_array() {
         }
     });
 
-    let result = test_generation("nested_inline_objects_test", spec).expect("Generation failed");
+    let result = test_generation("nested_inline_objects_test", spec)?;
 
     // Assert that the results item type was generated
     assert!(
@@ -244,10 +248,12 @@ fn test_nested_inline_objects_in_array() {
             || result.contains("pub results: Vec<NestedResponseItem>"),
         "Results field should use the generated item type"
     );
+
+    Ok(())
 }
 
 #[test]
-fn test_inline_object_property() {
+fn test_inline_object_property() -> Result<(), Box<dyn std::error::Error>> {
     // Test case for inline objects as properties (like function in ChatCompletionMessageToolCallChunk)
     let spec = json!({
         "openapi": "3.1.0",
@@ -283,7 +289,7 @@ fn test_inline_object_property() {
         }
     });
 
-    let result = test_generation("inline_object_property", spec).expect("Generation failed");
+    let result = test_generation("inline_object_property", spec)?;
 
     // Assert that a type was generated for the inline function object
     assert!(
@@ -309,10 +315,12 @@ fn test_inline_object_property() {
             && result.contains("pub name: Option<String>"),
         "Generated function struct should have arguments and name fields"
     );
+
+    Ok(())
 }
 
 #[test]
-fn test_inline_object_with_nullable_fields() {
+fn test_inline_object_with_nullable_fields() -> Result<(), Box<dyn std::error::Error>> {
     // Test case with nullable fields in inline object
     let spec = json!({
         "openapi": "3.1.0",
@@ -344,7 +352,7 @@ fn test_inline_object_with_nullable_fields() {
         }
     });
 
-    let result = test_generation("inline_object_nullable_test", spec).expect("Generation failed");
+    let result = test_generation("inline_object_nullable_test", spec)?;
 
     // Assert that the data item type was generated
     assert!(
@@ -364,4 +372,6 @@ fn test_inline_object_with_nullable_fields() {
         result.contains("pub required_field: String"),
         "Required field should be String, not Option<String>"
     );
+
+    Ok(())
 }

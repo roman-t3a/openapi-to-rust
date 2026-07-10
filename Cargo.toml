@@ -1,6 +1,6 @@
 [package]
 name = "openapi-to-rust"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["James Lal"]
@@ -60,6 +60,6 @@ specta = ["dep:specta"]
 name = "openapi-to-rust"
 path = "src/bin/openapi-to-rust.rs"
 
-[lints.clippy]
-unwrap_used = "deny"
-expect_used = "warn"
+# unwrap/expect policy lives on the library crate (`src/lib.rs`) so it does
+# not force integration tests and examples to avoid panicking helpers.
+# Production library code remains deny/warn.

@@ -119,11 +119,13 @@ fn extension_length_mismatch_is_silently_dropped() {
 
 #[test]
 fn x_enum_varnames_disabled_falls_back_to_heuristic() {
-    let mut cfg = TypeMappingConfig::default();
-    cfg.enums = Some(TypeEnumsConfig {
-        x_enum_varnames: Some(false),
-        x_enum_descriptions: None,
-    });
+    let cfg = TypeMappingConfig {
+        enums: Some(TypeEnumsConfig {
+            x_enum_varnames: Some(false),
+            x_enum_descriptions: None,
+        }),
+        ..Default::default()
+    };
     let code = generate(
         enum_spec(
             json!(["active", "inactive"]),
@@ -141,11 +143,13 @@ fn x_enum_varnames_disabled_falls_back_to_heuristic() {
 
 #[test]
 fn x_enum_descriptions_disabled_drops_doc_comments() {
-    let mut cfg = TypeMappingConfig::default();
-    cfg.enums = Some(TypeEnumsConfig {
-        x_enum_varnames: None,
-        x_enum_descriptions: Some(false),
-    });
+    let cfg = TypeMappingConfig {
+        enums: Some(TypeEnumsConfig {
+            x_enum_varnames: None,
+            x_enum_descriptions: Some(false),
+        }),
+        ..Default::default()
+    };
     let code = generate(
         enum_spec(
             json!(["fast", "slow"]),

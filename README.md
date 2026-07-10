@@ -555,6 +555,14 @@ cargo run --manifest-path examples/server-anthropic-messages/Cargo.toml
 
 ## Release notes
 
+### 0.5.5
+
+**Clippy / test hygiene**
+- `tests/inline_object_array_test.rs` now uses Result-returning tests instead of `expect` on generation Results, matching the fork's preferred test style under the unwrap/expect policy.
+- Unit-test modules in `src/server/{edit,list,selector}.rs` and `src/type_mapping.rs` follow the existing `openapi`/`patterns` convention of allowing unwrap/expect only inside `#[cfg(test)]`.
+- A few `field_reassign_with_default` and `for_kv_map` nits in tests cleaned up so `cargo clippy --all-targets -- -D warnings` is green.
+- Unwrap/expect deny/warn is enforced on the library crate (`src/lib.rs`) and main binary rather than package-wide, so integration tests and examples are not forced through the same panic policy. Library API is unchanged.
+
 ### 0.5.4
 
 **Opt-in request context on server traits**

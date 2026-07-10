@@ -127,11 +127,13 @@ fn ap_boolean_false_emits_no_field() {
 
 #[test]
 fn ap_typed_off_falls_back_to_untyped() {
-    let mut cfg = TypeMappingConfig::default();
-    cfg.shape = Some(TypeShapeConfig {
-        additional_properties_typed: Some(false),
+    let cfg = TypeMappingConfig {
+        shape: Some(TypeShapeConfig {
+            additional_properties_typed: Some(false),
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
     let code = generate(ap_spec(json!({ "type": "string" })), TypeMapper::new(cfg));
     assert!(
         code.contains(

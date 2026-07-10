@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used)]
+#![warn(clippy::expect_used)]
+
 use clap::{Parser, Subcommand};
 use openapi_to_rust::cli::{json_from_str_lossy, yaml_to_json_value};
 use openapi_to_rust::server::{

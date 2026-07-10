@@ -1,3 +1,9 @@
+// Package-level clippy unwrap/expect used to apply to integration tests and
+// examples too, which is not useful: those are allowed to panic on setup
+// failure (or return Result). Keep the policy on the library crate only.
+#![deny(clippy::unwrap_used)]
+#![warn(clippy::expect_used)]
+
 pub mod analysis;
 pub mod cli;
 pub mod client_generator;

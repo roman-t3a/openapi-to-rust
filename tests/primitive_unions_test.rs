@@ -103,11 +103,13 @@ fn anyof_three_primitives_default_emits_three_variants() {
 
 #[test]
 fn anyof_primitives_with_toggle_off_reverts_to_type_aliases() {
-    let mut cfg = TypeMappingConfig::default();
-    cfg.shape = Some(TypeShapeConfig {
-        primitive_unions: Some(false),
+    let cfg = TypeMappingConfig {
+        shape: Some(TypeShapeConfig {
+            primitive_unions: Some(false),
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
     let code = generate(primitive_union_spec(), TypeMapper::new(cfg));
     // Pre-Q2.7 shape: per-variant type aliases.
     assert!(

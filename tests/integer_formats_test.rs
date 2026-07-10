@@ -82,8 +82,10 @@ fn uint64_default_emits_u64() {
 
 #[test]
 fn unsigned_off_degrades_uint64_to_i64() {
-    let mut cfg = TypeMappingConfig::default();
-    cfg.unsigned = false;
+    let cfg = TypeMappingConfig {
+        unsigned: false,
+        ..Default::default()
+    };
     let code = generate(integer_spec("uint64"), TypeMapper::new(cfg));
     assert!(
         code.contains("pub value: i64"),

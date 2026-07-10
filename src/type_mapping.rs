@@ -824,6 +824,7 @@ impl TypeMapper {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -919,8 +920,10 @@ mod tests {
 
     #[test]
     fn unsigned_off_degrades_uint_to_i64() {
-        let mut cfg = TypeMappingConfig::default();
-        cfg.unsigned = false;
+        let cfg = TypeMappingConfig {
+            unsigned: false,
+            ..Default::default()
+        };
         let m = TypeMapper::new(cfg);
         assert_eq!(m.integer_format(Some("uint32")).rust_type, "i64");
         assert_eq!(m.integer_format(Some("uint64")).rust_type, "i64");
