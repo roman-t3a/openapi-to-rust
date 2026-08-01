@@ -107,6 +107,7 @@ fn generated_server_files()
             operations: vec!["createEntity".to_string()],
             prune_models: false,
             context_extensions: false,
+            validation: Default::default(),
         }),
         ..Default::default()
     };
@@ -205,6 +206,7 @@ fn server_generation_advises_framework_dependencies() -> Result<(), Box<dyn std:
             operations: vec!["createEntity".to_string()],
             prune_models: false,
             context_extensions: false,
+            validation: Default::default(),
         }),
         ..Default::default()
     };

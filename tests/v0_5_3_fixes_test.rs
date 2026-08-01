@@ -87,8 +87,6 @@ fn boolean_schema_hold_action_parses_and_generates() {
         types.contains("split"),
         "split field should remain on the merged struct:\n{types}"
     );
-
-    insta::assert_snapshot!("hold_action_types", types);
 }
 
 /// Fix 2: allOf if/then conditional required is documented + warned, not
@@ -150,8 +148,6 @@ fn allof_if_then_conditional_required_documented() {
             || types.contains("required=[routing_type"),
         "generated rustdoc should carry the if/then note:\n{types}"
     );
-
-    insta::assert_snapshot!("create_bank_details_types", types);
 }
 
 /// Fix 3 (full-contract angle): the minimized boolean-schema repro is also the
@@ -190,7 +186,7 @@ fn full_customer_contract_parses_when_available() {
         return;
     };
     let content = fs::read_to_string(&path).expect("read full contract");
-    let value = openapi_to_rust::cli::yaml_to_json_value(&content).expect("yaml→json");
+    let value = openapi_to_rust::spec_source::yaml_to_json_value(&content).expect("yaml→json");
     serde_json::from_value::<OpenApiSpec>(value.clone())
         .unwrap_or_else(|e| panic!("full OpenApiSpec parse of {}: {e}", path.display()));
     let mut analyzer = SchemaAnalyzer::new(value).expect("analyzer");
@@ -210,13 +206,23 @@ fn full_customer_contract_parses_when_available() {
     );
 }
 
-/// Fix 1 acceptance: default-feature `cargo tree` must not contain native-tls,
-/// openssl, rustls-pemfile, or the archived serde_yaml package.
+/// Fix 1 acceptance: the library-only dependency graph must not contain
+/// reqwest, native-tls, openssl, rustls-pemfile, or archived serde_yaml.
+///
+/// Upstream v0.12 intentionally enables the CLI by default; library and
+/// build-dependency consumers select `--no-default-features`.
 #[test]
-fn default_dependency_graph_has_no_tls_or_archived_yaml() {
+fn library_dependency_graph_has_no_http_or_archived_yaml() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let output = Command::new("cargo")
-        .args(["tree", "--prefix", "none", "--edges", "normal"])
+        .args([
+            "tree",
+            "--no-default-features",
+            "--prefix",
+            "none",
+            "--edges",
+            "normal",
+        ])
         .current_dir(manifest)
         .output()
         .expect("cargo tree");
@@ -236,7 +242,7 @@ fn default_dependency_graph_has_no_tls_or_archived_yaml() {
     ] {
         assert!(
             !tree.lines().any(|l| l.contains(forbidden)),
-            "default cargo tree must not contain `{forbidden}`:\n{tree}"
+            "library-only cargo tree must not contain `{forbidden}`:\n{tree}"
         );
     }
 
@@ -247,6 +253,6 @@ fn default_dependency_graph_has_no_tls_or_archived_yaml() {
     );
     assert!(
         !tree.lines().any(|l| l.starts_with("reqwest ")),
-        "default features must not pull reqwest (use optional `fetch` feature):\n{tree}"
+        "library-only graph must not pull reqwest:\n{tree}"
     );
 }

@@ -1,7 +1,4 @@
-use crate::{
-    GeneratorError, Result, analysis::SchemaAnalysis, streaming::StreamingConfig,
-    type_mapping::DepRequirement,
-};
+use crate::{GeneratorError, Result, analysis::SchemaAnalysis, streaming::StreamingConfig};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::BTreeMap;
@@ -89,13 +86,37 @@ fn strip_trailing_zero(v: f64) -> String {
 
 /// Info about schemas that are variants in discriminated unions
 #[derive(Clone)]
-struct DiscriminatedVariantInfo {
+pub(crate) struct DiscriminatedVariantInfo {
     /// The discriminator field name (e.g., "type")
-    discriminator_field: String,
+    pub(crate) discriminator_field: String,
     /// The const value of the discriminator (e.g., "text")
-    discriminator_value: String,
+    pub(crate) discriminator_value: String,
     /// Whether the parent union is untagged
-    is_parent_untagged: bool,
+    pub(crate) is_parent_untagged: bool,
+}
+
+/// One object property after discriminator filtering and Rust-identifier
+/// disambiguation. Struct fields, request-model constructors, and builders
+/// all consume this shared projection so their names and types cannot drift.
+pub(crate) struct EmittedObjectProperty<'a> {
+    pub(crate) wire_name: &'a str,
+    pub(crate) property: &'a crate::analysis::PropertyInfo,
+    pub(crate) ident: syn::Ident,
+    pub(crate) is_required: bool,
+    pub(crate) field_type: TokenStream,
+}
+
+/// Shared lookups for one types.rs generation pass. Large schemas can contain
+/// thousands of operations and types, so request-root and type-name queries
+/// must not rescan the full analysis for each emitted object.
+struct TypeGenerationIndex {
+    request_body_roots: std::collections::HashSet<String>,
+    reserved_type_names: std::collections::HashSet<String>,
+}
+
+struct TypeGenerationContext<'a> {
+    discriminated_variants: &'a BTreeMap<String, DiscriminatedVariantInfo>,
+    index: &'a TypeGenerationIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -150,9 +171,14 @@ pub struct GeneratorConfig {
     /// TOML section. Q2.0 introduces this field; with the default value
     /// every mapping preserves pre-refactor behavior.
     pub types: crate::type_mapping::TypeMappingConfig,
+    /// Additive operation-builder generation policy.
+    pub builders: crate::config::BuildersSection,
     /// Opt-in server codegen scope. `None` ⇒ emit no server code.
     /// Set by the `[server]` section in the TOML config.
     pub server: Option<crate::config::ServerSection>,
+    /// Optional HTTP-client operation scope. `None` or an empty selector list
+    /// preserves generation of every operation.
+    pub client: Option<crate::config::ClientSection>,
 }
 
 impl Default for GeneratorConfig {
@@ -176,7 +202,55 @@ impl Default for GeneratorConfig {
             enable_registry: false,
             registry_only: false,
             types: crate::type_mapping::TypeMappingConfig::default(),
+            builders: crate::config::BuildersSection::default(),
             server: None,
+            client: None,
+        }
+    }
+}
+
+impl GeneratorConfig {
+    /// Adopt the document's `servers[0].url` as the client's default base URL
+    /// when configuration didn't supply one.
+    ///
+    /// The spec already states where the API lives; making every user restate
+    /// it in TOML (or discover at runtime that requests go nowhere) is friction
+    /// with no upside. Explicit configuration always wins.
+    ///
+    /// Two server URLs are deliberately ignored: relative ones (`/v1`), which
+    /// are meaningless without an origin, and templated ones containing `{}`
+    /// server variables, which are not usable until substituted.
+    pub fn apply_spec_server_default(&mut self, spec: &serde_json::Value) {
+        let already_configured = self
+            .http_client_config
+            .as_ref()
+            .and_then(|http| http.base_url.as_deref())
+            .is_some_and(|url| !url.is_empty());
+        if already_configured {
+            return;
+        }
+
+        let Some(url) = spec
+            .pointer("/servers/0/url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .filter(|url| !url.starts_with('/'))
+            .filter(|url| !url.contains('{'))
+        else {
+            return;
+        };
+
+        match self.http_client_config.as_mut() {
+            Some(http) => http.base_url = Some(url.to_string()),
+            None => {
+                self.http_client_config = Some(crate::http_config::HttpClientConfig {
+                    base_url: Some(url.to_string()),
+                    timeout_seconds: None,
+                    max_response_body_bytes: None,
+                    default_headers: Default::default(),
+                })
+            }
         }
     }
 }
@@ -188,6 +262,69 @@ pub fn default_type_mappings() -> BTreeMap<String, String> {
     mappings.insert("string".to_string(), "String".to_string());
     mappings.insert("boolean".to_string(), "bool".to_string());
     mappings
+}
+
+/// Convert an OpenAPI schema name to the canonical Rust model identifier.
+///
+/// Every code-generation surface must use this helper rather than parsing raw
+/// component keys as Rust types; otherwise names such as `not-found` panic and
+/// names such as `inline_response_200` refer to models that were never emitted.
+pub(crate) fn rust_type_name(s: &str) -> String {
+    let mut result = String::new();
+    let mut next_upper = true;
+
+    for c in s.chars() {
+        match c {
+            'a'..='z' => {
+                result.push(if next_upper {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                });
+                next_upper = false;
+            }
+            'A'..='Z' | '0'..='9' => {
+                result.push(c);
+                next_upper = false;
+            }
+            _ => next_upper = true,
+        }
+    }
+
+    if result.is_empty() {
+        result = "Type".to_string();
+    }
+    if result.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        result = format!("Type{result}");
+    }
+    if matches!(
+        result.as_str(),
+        "Result"
+            | "Option"
+            | "Box"
+            | "Vec"
+            | "String"
+            | "Some"
+            | "None"
+            | "Ok"
+            | "Err"
+            | "Default"
+            | "Clone"
+            | "Debug"
+            | "Send"
+            | "Sync"
+            | "Sized"
+            | "Iterator"
+            | "From"
+            | "Into"
+            | "TryFrom"
+            | "TryInto"
+            | "AsRef"
+            | "AsMut"
+    ) {
+        result.push_str("Type");
+    }
+    result
 }
 
 /// Represents a generated file
@@ -206,20 +343,41 @@ pub struct GenerationResult {
     pub files: Vec<GeneratedFile>,
     /// Generated mod.rs content that exports all modules
     pub mod_file: GeneratedFile,
-    /// Crates the generated code references beyond `std`. The CLI
-    /// uses this to write `REQUIRED_DEPS.toml` next to the generated
-    /// module and to print a stderr summary so users know exactly
-    /// what to add to their `Cargo.toml`.
+    /// Complete direct dependencies for the exact files in this result,
+    /// including required crate features and compatible versions. The CLI
+    /// writes these as `REQUIRED_DEPS.toml` next to the generated module.
     pub required_deps: Vec<crate::type_mapping::DepRequirement>,
+    /// Number of schemas removed by opt-in client/server model pruning.
+    pub pruned_schemas: usize,
+}
+
+#[derive(Debug)]
+struct OperationScopes {
+    /// `None` means the enabled HTTP client keeps every operation.
+    client_ids: Option<std::collections::BTreeSet<String>>,
+    server_ids: std::collections::BTreeSet<String>,
+    streaming_ids: std::collections::BTreeSet<String>,
+    prune_models: bool,
+    extra_schema_roots: Vec<String>,
 }
 
 pub struct CodeGenerator {
     config: GeneratorConfig,
+    source_provenance: Option<String>,
 }
 
 impl CodeGenerator {
     pub fn new(config: GeneratorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            source_provenance: None,
+        }
+    }
+
+    /// Attach a sanitized source label to generated module headers.
+    pub fn with_source_provenance(mut self, source: impl Into<String>) -> Self {
+        self.source_provenance = Some(source.into());
+        self
     }
 
     /// Get reference to the generator configuration
@@ -227,8 +385,25 @@ impl CodeGenerator {
         &self.config
     }
 
+    pub(crate) fn provenance_attribute(&self) -> TokenStream {
+        self.source_provenance
+            .as_ref()
+            .map(|source| {
+                let provenance = format!(
+                    " Generated by openapi-to-rust v{}. Source OpenAPI document: {source}",
+                    env!("CARGO_PKG_VERSION")
+                );
+                quote! { #![doc = #provenance] }
+            })
+            .unwrap_or_default()
+    }
+
     /// Generate all files for the API
     pub fn generate_all(&self, analysis: &mut SchemaAnalysis) -> Result<GenerationResult> {
+        // Resolve client/server selectors exactly once for this generation.
+        // The same scopes drive client artifacts and the union model closure.
+        let scopes = self.resolve_operation_scopes(analysis)?;
+        let pruned_schemas = self.prune_models_to_scopes(analysis, &scopes);
         let mut files = Vec::new();
 
         if !self.config.registry_only {
@@ -240,7 +415,21 @@ impl CodeGenerator {
             });
 
             // Generate streaming client if configured
-            if let Some(ref streaming_config) = self.config.streaming_config {
+            if self.config.enable_sse_client
+                && let Some(ref streaming_config) = self.config.streaming_config
+            {
+                if streaming_config.generate_client && !streaming_config.event_parser_helpers {
+                    return Err(GeneratorError::ValidationError(
+                        "streaming generate_client=true requires event_parser_helpers=true"
+                            .to_string(),
+                    ));
+                }
+                if streaming_config.event_parser_helpers {
+                    files.push(GeneratedFile {
+                        path: "sse.rs".into(),
+                        content: self.generate_sse_runtime()?,
+                    });
+                }
                 let streaming_content =
                     self.generate_streaming_client(streaming_config, analysis)?;
                 files.push(GeneratedFile {
@@ -251,7 +440,9 @@ impl CodeGenerator {
 
             // Generate HTTP client if enabled
             if self.config.enable_async_client {
-                let http_content = self.generate_http_client(analysis)?;
+                let operations = self.client_operations(analysis, scopes.client_ids.as_ref());
+                let http_content =
+                    self.generate_http_client_for_operations(analysis, &operations)?;
                 files.push(GeneratedFile {
                     path: "client.rs".into(),
                     content: http_content,
@@ -268,6 +459,28 @@ impl CodeGenerator {
             });
         }
 
+        // Server files are part of the same generation result so module wiring,
+        // dependency collection, and disk writes cannot drift from the CLI's
+        // post-processing path.
+        if !self.config.registry_only
+            && let Some(server) = self
+                .config
+                .server
+                .as_ref()
+                .filter(|server| !server.operations.is_empty())
+        {
+            let server_files =
+                crate::server::codegen::ServerCodegen::new(&self.config, analysis, server)
+                    .with_source_provenance(self.source_provenance.as_deref())
+                    .generate()
+                    .map_err(|error| {
+                        GeneratorError::CodeGenError(format!(
+                            "server code generation failed: {error}"
+                        ))
+                    })?;
+            files.extend(server_files);
+        }
+
         // Generate mod.rs file
         let mod_content = self.generate_mod_file(&files)?;
         let mod_file = GeneratedFile {
@@ -275,19 +488,16 @@ impl CodeGenerator {
             content: mod_content,
         };
 
-        // Snapshot crates referenced by generated output. Q2.8
-        // surfaces these via REQUIRED_DEPS.toml (written by
-        // `write_files`) and a CLI stderr summary.
-        let mut required_deps =
-            crate::type_mapping::collect_dep_requirements(&analysis.used_type_features);
-        required_deps.extend(self.server_dep_requirements());
-        required_deps.sort_by_key(|d| d.crate_name);
-        required_deps.dedup_by_key(|d| d.crate_name);
+        let required_deps = crate::type_mapping::collect_generated_dep_requirements(
+            files.iter().map(|file| file.content.as_str()),
+            self.config.enable_specta,
+        );
 
         Ok(GenerationResult {
             files,
             mod_file,
             required_deps,
+            pruned_schemas,
         })
     }
 
@@ -296,26 +506,9 @@ impl CodeGenerator {
         self.generate_types(analysis)
     }
 
-    fn server_dep_requirements(&self) -> Vec<DepRequirement> {
-        if self
-            .config
-            .server
-            .as_ref()
-            .is_none_or(|server| server.operations.is_empty())
-        {
-            return Vec::new();
-        }
-
-        vec![
-            DepRequirement::new("async-trait", "0.1"),
-            DepRequirement::new("axum", "0.8"),
-            DepRequirement::new("serde", "1").with_features(&["derive"]),
-            DepRequirement::new("serde_json", "1"),
-        ]
-    }
-
     /// Generate the types.rs file content
     fn generate_types(&self, analysis: &mut SchemaAnalysis) -> Result<String> {
+        let provenance_attribute = self.provenance_attribute();
         let mut type_definitions = TokenStream::new();
 
         // Collect all schemas that are used as variants in discriminated unions
@@ -360,6 +553,12 @@ impl CodeGenerator {
             }
         }
 
+        let type_index = self.type_generation_index(analysis);
+        let type_context = TypeGenerationContext {
+            discriminated_variants: &discriminated_variant_info,
+            index: &type_index,
+        };
+
         // Generate types based on dependency order
         let generation_order = analysis.dependencies.topological_sort()?;
 
@@ -382,8 +581,7 @@ impl CodeGenerator {
                     processed.insert(schema_name);
                     continue;
                 }
-                let type_def =
-                    self.generate_type_definition(schema, analysis, &discriminated_variant_info)?;
+                let type_def = self.generate_type_definition(schema, analysis, &type_context)?;
                 if !type_def.is_empty() {
                     type_definitions.extend(type_def);
                 }
@@ -404,8 +602,7 @@ impl CodeGenerator {
             if !emitted_rust_names.insert(rust_name) {
                 continue;
             }
-            let type_def =
-                self.generate_type_definition(schema, analysis, &discriminated_variant_info)?;
+            let type_def = self.generate_type_definition(schema, analysis, &type_context)?;
             if !type_def.is_empty() {
                 type_definitions.extend(type_def);
             }
@@ -419,27 +616,33 @@ impl CodeGenerator {
             .used_type_features
             .contains(crate::type_mapping::TypeFeature::Base64)
         {
+            let engine = match self.config.types.byte {
+                crate::type_mapping::ByteStrategy::Base64UrlUnpadded => {
+                    quote::format_ident!("URL_SAFE_NO_PAD")
+                }
+                _ => quote::format_ident!("STANDARD"),
+            };
             quote! {
                 /// base64 codec for `Vec<u8>` fields produced from
                 /// `format: byte`. Used via `#[serde(with = "base64_serde")]`
                 /// for required/non-null fields; `with = "base64_serde::option"`
                 /// for the Option<Vec<u8>> case.
                 mod base64_serde {
-                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    use base64::{Engine as _, engine::general_purpose::#engine as ENGINE};
                     use serde::{Deserialize, Deserializer, Serializer};
 
                     pub fn serialize<S: Serializer>(
                         bytes: &Vec<u8>,
                         ser: S,
                     ) -> Result<S::Ok, S::Error> {
-                        ser.serialize_str(&STANDARD.encode(bytes))
+                        ser.serialize_str(&ENGINE.encode(bytes))
                     }
 
                     pub fn deserialize<'de, D: Deserializer<'de>>(
                         de: D,
                     ) -> Result<Vec<u8>, D::Error> {
                         let s = String::deserialize(de)?;
-                        STANDARD
+                        ENGINE
                             .decode(s.as_bytes())
                             .map_err(serde::de::Error::custom)
                     }
@@ -468,7 +671,7 @@ impl CodeGenerator {
                         ) -> Result<Option<Vec<u8>>, D::Error> {
                             let opt = Option::<String>::deserialize(de)?;
                             opt.map(|s| {
-                                STANDARD
+                                ENGINE
                                     .decode(s.as_bytes())
                                     .map_err(serde::de::Error::custom)
                             })
@@ -481,12 +684,55 @@ impl CodeGenerator {
             TokenStream::new()
         };
 
+        // `time::Date` / `time::Time` have no built-in serde codec
+        // in the `time` crate (`time::serde::iso8601` is
+        // OffsetDateTime-only — GH #25), so declare one per type via
+        // the `format_description!` macro. It expands to a module
+        // (with an `::option` submodule) referenced from fields as
+        // `#[serde(with = "time_date_format")]` etc.
+        let time_date_helper = if analysis
+            .used_type_features
+            .contains(crate::type_mapping::TypeFeature::TimeDate)
+        {
+            quote! {
+                time::serde::format_description!(
+                    time_date_format,
+                    Date,
+                    "[year]-[month]-[day]"
+                );
+            }
+        } else {
+            TokenStream::new()
+        };
+
+        // RFC 3339 partial-time. `[optional [...]]` groups always
+        // format their contents, so whole seconds serialize with a
+        // trailing ".0" — in exchange, parsing accepts inputs both
+        // with and without fractional seconds.
+        let time_time_helper = if analysis
+            .used_type_features
+            .contains(crate::type_mapping::TypeFeature::TimeTime)
+        {
+            quote! {
+                time::serde::format_description!(
+                    version = 2,
+                    time_time_format,
+                    Time,
+                    "[hour]:[minute]:[second][optional [.[subsecond]]]"
+                );
+            }
+        } else {
+            TokenStream::new()
+        };
+
         // Generate file with imports and types (no module wrapper).
         let generated = quote! {
             //! Generated types from OpenAPI specification
             //!
             //! This file contains all the generated types for the API.
             //! Do not edit manually - regenerate using the appropriate script.
+
+            #provenance_attribute
 
             #![allow(clippy::large_enum_variant)]
             #![allow(clippy::format_in_format_args)]
@@ -496,6 +742,10 @@ impl CodeGenerator {
             use serde::{Deserialize, Serialize};
 
             #base64_helper
+
+            #time_date_helper
+
+            #time_time_helper
 
             #type_definitions
         };
@@ -517,6 +767,11 @@ impl CodeGenerator {
         analysis: &SchemaAnalysis,
     ) -> Result<String> {
         let mut client_code = TokenStream::new();
+        let provenance_attribute = self.provenance_attribute();
+        let duration_import = streaming_config
+            .reconnection_config
+            .as_ref()
+            .map(|_| quote! { use std::time::Duration; });
 
         // Generate imports
         let imports = quote! {
@@ -524,24 +779,33 @@ impl CodeGenerator {
             //!
             //! This file contains the streaming client implementation.
             //! Do not edit manually - regenerate using the appropriate script.
+            #provenance_attribute
             #![allow(clippy::format_in_format_args)]
             #![allow(clippy::let_unit_value)]
             #![allow(unused_mut)]
 
             use super::types::*;
             use async_trait::async_trait;
-            use futures_util::{Stream, StreamExt};
+            use futures_util::Stream;
             use std::pin::Pin;
-            use std::time::Duration;
             use reqwest::header::{HeaderMap, HeaderValue};
-            use tracing::{debug, error, info, warn, instrument};
+            use tracing::{debug, info, instrument};
+            #duration_import
         };
         client_code.extend(imports);
 
-        // Generate error types
         if streaming_config.generate_client {
-            let error_types = self.generate_streaming_error_types()?;
-            client_code.extend(error_types);
+            if streaming_config.reconnection_config.is_some() {
+                client_code.extend(quote! {
+                    use super::sse::{SseClient, SseReconnectOptions};
+                    pub use super::sse::StreamingError;
+                });
+            } else {
+                client_code.extend(quote! {
+                    use super::sse::SseClient;
+                    pub use super::sse::StreamingError;
+                });
+            }
         }
 
         // Generate client trait for each endpoint
@@ -554,12 +818,6 @@ impl CodeGenerator {
         if streaming_config.generate_client {
             let client_impl = self.generate_streaming_client_impl(streaming_config, analysis)?;
             client_code.extend(client_impl);
-        }
-
-        // Generate SSE parsing utilities
-        if streaming_config.event_parser_helpers {
-            let parser_code = self.generate_sse_parser_utilities(streaming_config)?;
-            client_code.extend(parser_code);
         }
 
         // Generate reconnection utilities if configured
@@ -575,17 +833,33 @@ impl CodeGenerator {
         Ok(prettyplease::unparse(&syntax_tree))
     }
 
-    /// Generate HTTP client code for regular (non-streaming) requests
+    /// Generate HTTP client code for regular (non-streaming) requests.
+    ///
+    /// This standalone entry point honors `[client].operations` but does not
+    /// validate unrelated server or streaming scopes. Use [`Self::generate_all`]
+    /// when generating the complete configured output set.
     pub fn generate_http_client(&self, analysis: &SchemaAnalysis) -> Result<String> {
+        let client_ids = self.resolve_client_operation_ids(analysis)?;
+        let operations = self.client_operations(analysis, client_ids.as_ref());
+        self.generate_http_client_for_operations(analysis, &operations)
+    }
+
+    fn generate_http_client_for_operations(
+        &self,
+        analysis: &SchemaAnalysis,
+        operations: &[&crate::analysis::OperationInfo],
+    ) -> Result<String> {
+        let provenance_attribute = self.provenance_attribute();
         let error_types = self.generate_http_error_types();
         let client_struct = self.generate_http_client_struct();
-        let operation_methods = self.generate_operation_methods(analysis);
+        let operation_methods = self.generate_operation_methods_for(analysis, operations);
 
         let generated = quote! {
             //! Generated HTTP client for regular API requests
             //!
             //! This file contains the HTTP client implementation for GET, POST, etc.
             //! Do not edit manually - regenerate using the appropriate script.
+            #provenance_attribute
             #![allow(clippy::format_in_format_args)]
             #![allow(clippy::let_unit_value)]
 
@@ -598,11 +872,169 @@ impl CodeGenerator {
             #operation_methods
         };
 
-        let syntax_tree = syn::parse2::<syn::File>(generated).map_err(|e| {
+        let syntax_tree = syn::parse2::<syn::File>(generated.clone()).map_err(|e| {
+            if let Ok(dump) = std::env::var("OATR_DUMP_TOKENS_ON_PARSE_ERROR") {
+                let _ = std::fs::write(&dump, generated.to_string());
+            }
             GeneratorError::CodeGenError(format!("Failed to parse HTTP client code: {e}"))
         })?;
 
         Ok(prettyplease::unparse(&syntax_tree))
+    }
+
+    fn resolve_operation_scopes(&self, analysis: &SchemaAnalysis) -> Result<OperationScopes> {
+        let client_ids = if self.config.enable_async_client && !self.config.registry_only {
+            self.resolve_client_operation_ids(analysis)?
+        } else {
+            None
+        };
+
+        let server_ids = match &self.config.server {
+            Some(server) if !server.operations.is_empty() => {
+                crate::server::resolve_operation_selectors(&server.operations, analysis)
+                    .map_err(|error| {
+                        GeneratorError::ValidationError(format!(
+                            "Invalid [server].operations: {error}"
+                        ))
+                    })?
+                    .operations
+                    .into_iter()
+                    .map(|operation| operation.operation_id)
+                    .collect()
+            }
+            _ => Default::default(),
+        };
+
+        let streaming_ids = if self.config.registry_only || !self.config.enable_sse_client {
+            Default::default()
+        } else if let Some(streaming) = &self.config.streaming_config {
+            let mut ids = std::collections::BTreeSet::new();
+            for (index, endpoint) in streaming.endpoints.iter().enumerate() {
+                let resolution =
+                    crate::server::resolve_operation_id(&endpoint.operation_id, analysis).map_err(
+                        |error| {
+                            GeneratorError::ValidationError(format!(
+                                "Invalid [streaming].endpoints[{index}].operation_id: {error}"
+                            ))
+                        },
+                    )?;
+                ids.extend(
+                    resolution
+                        .operations
+                        .into_iter()
+                        .map(|operation| operation.operation_id),
+                );
+            }
+            ids
+        } else {
+            Default::default()
+        };
+
+        let client_prunes = self.config.enable_async_client
+            && !self.config.registry_only
+            && self
+                .config
+                .client
+                .as_ref()
+                .is_some_and(|client| client.prune_models);
+        let server_prunes = self
+            .config
+            .server
+            .as_ref()
+            .is_some_and(|server| server.prune_models && !server.operations.is_empty());
+        let extra_schema_roots = if self.config.registry_only || !self.config.enable_sse_client {
+            Vec::new()
+        } else {
+            self.config
+                .streaming_config
+                .as_ref()
+                .map(|streaming| {
+                    streaming
+                        .endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.event_union_type.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        Ok(OperationScopes {
+            client_ids,
+            server_ids,
+            streaming_ids,
+            prune_models: client_prunes || server_prunes,
+            extra_schema_roots,
+        })
+    }
+
+    fn resolve_client_operation_ids(
+        &self,
+        analysis: &SchemaAnalysis,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        match &self.config.client {
+            Some(client) if !client.operations.is_empty() => {
+                let resolution =
+                    crate::server::resolve_operation_selectors(&client.operations, analysis)
+                        .map_err(|error| {
+                            GeneratorError::ValidationError(format!(
+                                "Invalid [client].operations: {error}"
+                            ))
+                        })?;
+                Ok(Some(
+                    resolution
+                        .operations
+                        .into_iter()
+                        .map(|operation| operation.operation_id)
+                        .collect(),
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn client_operations<'a>(
+        &self,
+        analysis: &'a SchemaAnalysis,
+        selected: Option<&std::collections::BTreeSet<String>>,
+    ) -> Vec<&'a crate::analysis::OperationInfo> {
+        analysis
+            .operations
+            .iter()
+            .filter(|(operation_id, _)| selected.is_none_or(|ids| ids.contains(*operation_id)))
+            .map(|(_, operation)| operation)
+            .collect()
+    }
+
+    fn prune_models_to_scopes(
+        &self,
+        analysis: &mut SchemaAnalysis,
+        scopes: &OperationScopes,
+    ) -> usize {
+        if !scopes.prune_models {
+            return 0;
+        }
+
+        let mut consumer_ids = scopes.server_ids.clone();
+        if self.config.enable_async_client && !self.config.registry_only {
+            match &scopes.client_ids {
+                Some(ids) => consumer_ids.extend(ids.iter().cloned()),
+                None => consumer_ids.extend(analysis.operations.keys().cloned()),
+            }
+        }
+        consumer_ids.extend(scopes.streaming_ids.iter().cloned());
+
+        let operations: Vec<&crate::analysis::OperationInfo> = consumer_ids
+            .iter()
+            .filter_map(|operation_id| analysis.operations.get(operation_id))
+            .collect();
+        let keep = crate::server::codegen::reachable_schemas_with_roots(
+            analysis,
+            &operations,
+            &scopes.extra_schema_roots,
+        );
+        let before = analysis.schemas.len();
+        analysis.schemas.retain(|name, _| keep.contains(name));
+        before - analysis.schemas.len()
     }
 
     /// Generate HTTP error type and result alias
@@ -610,8 +1042,34 @@ impl CodeGenerator {
         quote! {
             use thiserror::Error;
 
-            /// Transport-level errors: failures where we never received an
-            /// inspectable HTTP response from the server.
+            /// The generated validation-problem profile based on RFC 9457.
+            /// The distinctive namespace avoids collisions with user schemas.
+            pub mod openapi_to_rust_problem {
+                #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+                pub struct ProblemDetails {
+                    #[serde(rename = "type")]
+                    pub type_uri: String,
+                    pub title: String,
+                    pub status: u16,
+                    pub code: String,
+                    #[serde(default)]
+                    pub errors: Vec<InvalidParameter>,
+                    #[serde(default, skip_serializing_if = "Option::is_none")]
+                    pub detail: Option<String>,
+                    #[serde(default, skip_serializing_if = "Option::is_none")]
+                    pub instance: Option<String>,
+                }
+
+                #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+                pub struct InvalidParameter {
+                    pub code: String,
+                    pub location: String,
+                    pub message: String,
+                }
+            }
+
+            /// Transport-level errors: failures where no safely inspectable
+            /// HTTP response is available to the caller.
             ///
             /// HTTP responses with non-2xx status codes are surfaced as
             /// [`ApiError`] inside [`ApiOpError::Api`], not here, so callers can
@@ -639,6 +1097,10 @@ impl CodeGenerator {
                 #[error("Request timeout")]
                 Timeout,
 
+                /// A response body exceeded the configured in-memory limit
+                #[error("Response body exceeded configured limit of {limit} bytes")]
+                ResponseTooLarge { limit: usize },
+
                 /// Invalid configuration
                 #[error("Configuration error: {0}")]
                 Config(String),
@@ -665,17 +1127,36 @@ impl CodeGenerator {
             ///
             /// Includes both non-2xx responses and 2xx responses whose body
             /// failed to deserialize into the expected success type. `status`,
-            /// `headers`, and `body` are always populated so callers can
-            /// inspect what the server sent without modifying the generated
-            /// code. `typed` carries the parsed per-operation error variant
-            /// when the body matched a declared schema.
+            /// `headers`, and `raw_body` preserve what the server actually sent,
+            /// while `body` is a convenient lossy UTF-8 rendering. `typed`
+            /// carries the parsed per-operation error variant
+            /// when the body matched a declared schema. Formatting the error
+            /// limits only the displayed body preview; the public fields
+            /// retain the complete response and parsing details.
             #[derive(Debug, Clone)]
             pub struct ApiError<E> {
                 pub status: u16,
                 pub headers: reqwest::header::HeaderMap,
                 pub body: String,
+                /// Exact response bytes before lossy UTF-8 conversion.
+                pub raw_body: Vec<u8>,
                 pub typed: Option<E>,
                 pub parse_error: Option<String>,
+            }
+
+            const API_ERROR_BODY_DISPLAY_LIMIT: usize = 500;
+            const API_ERROR_BODY_TRUNCATION_MARKER: &str = "... [truncated]";
+
+            fn display_api_error_body(body: &str) -> std::borrow::Cow<'_, str> {
+                let Some((end, _)) = body.char_indices().nth(API_ERROR_BODY_DISPLAY_LIMIT) else {
+                    return std::borrow::Cow::Borrowed(body);
+                };
+
+                let mut displayed =
+                    String::with_capacity(end + API_ERROR_BODY_TRUNCATION_MARKER.len());
+                displayed.push_str(&body[..end]);
+                displayed.push_str(API_ERROR_BODY_TRUNCATION_MARKER);
+                std::borrow::Cow::Owned(displayed)
             }
 
             impl<E> ApiError<E> {
@@ -692,11 +1173,52 @@ impl CodeGenerator {
                 pub fn is_retryable(&self) -> bool {
                     matches!(self.status, 429 | 500 | 502 | 503 | 504)
                 }
+
+                /// Decode the generated RFC 9457 validation-problem profile
+                /// without replacing a documented per-operation error in `typed`.
+                ///
+                /// Returns `None` unless the response's `Content-Type` is
+                /// `application/problem+json`, which is how RFC 9457 identifies
+                /// a problem document. Most third-party APIs return their
+                /// errors as plain `application/json`, so this yields `None`
+                /// against them by design — use `typed` for a documented
+                /// per-operation error body, or `body` for the raw payload.
+                /// Servers generated by this tool always emit the problem
+                /// media type, so this succeeds against them.
+                pub fn problem_details(
+                    &self,
+                ) -> Option<openapi_to_rust_problem::ProblemDetails> {
+                    let content_type = self
+                        .headers
+                        .get(reqwest::header::CONTENT_TYPE)?
+                        .to_str()
+                        .ok()?;
+                    let media_type = content_type.split(';').next()?.trim();
+                    if !media_type.eq_ignore_ascii_case("application/problem+json") {
+                        return None;
+                    }
+                    serde_json::from_str(&self.body).ok()
+                }
             }
 
             impl<E: std::fmt::Debug> std::fmt::Display for ApiError<E> {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    write!(f, "API error {}: {}", self.status, self.body)
+                    write!(
+                        f,
+                        "API error {}: {}",
+                        self.status,
+                        display_api_error_body(&self.body)
+                    )?;
+
+                    if let Some(typed) = &self.typed {
+                        write!(f, "; typed: {typed:?}")?;
+                    }
+
+                    if let Some(parse_error) = &self.parse_error {
+                        write!(f, "; parse error: {parse_error}")?;
+                    }
+
+                    Ok(())
                 }
             }
 
@@ -757,17 +1279,29 @@ impl CodeGenerator {
 
     /// Generate mod.rs file that exports all modules
     fn generate_mod_file(&self, files: &[GeneratedFile]) -> Result<String> {
-        let mut module_declarations = Vec::new();
-        let mut pub_uses = Vec::new();
+        let mut module_names = std::collections::BTreeSet::new();
 
         for file in files {
-            if let Some(module_name) = file.path.file_stem().and_then(|s| s.to_str()) {
-                if module_name != "mod" {
-                    module_declarations.push(format!("pub mod {module_name};"));
-                    pub_uses.push(format!("pub use {module_name}::*;"));
-                }
+            let module_name = if file.path.components().count() > 1 {
+                file.path.iter().next().and_then(|part| part.to_str())
+            } else {
+                file.path.file_stem().and_then(|stem| stem.to_str())
+            };
+            if let Some(module_name) = module_name.filter(|name| *name != "mod") {
+                module_names.insert(module_name.to_string());
             }
         }
+        let module_declarations = module_names
+            .iter()
+            .map(|name| format!("pub mod {name};"))
+            .collect::<Vec<_>>();
+        let pub_uses = module_names
+            .iter()
+            // The SSE runtime intentionally keeps transport-level names under
+            // `sse::` so they cannot collide with API-specific streaming types.
+            .filter(|name| name.as_str() != "sse")
+            .map(|name| format!("pub use {name}::*;"))
+            .collect::<Vec<_>>();
 
         // `module_name` is a configurable *label* — it does NOT pick
         // the on-disk directory (that's `output_dir`) and it does NOT
@@ -780,6 +1314,16 @@ impl CodeGenerator {
              //! preferred path, e.g. `pub mod {name};` in your crate root.\n",
             name = self.config.module_name,
         );
+        let source_hint = self
+            .source_provenance
+            .as_ref()
+            .map(|source| {
+                format!(
+                    "//! Generated by openapi-to-rust v{}. Source OpenAPI document: {source}\n",
+                    env!("CARGO_PKG_VERSION")
+                )
+            })
+            .unwrap_or_default();
 
         let content = format!(
             r#"//! Generated API modules
@@ -787,6 +1331,7 @@ impl CodeGenerator {
 //! This module exports all generated API types and clients.
 //! Do not edit manually - regenerate using the appropriate script.
 //!
+{source_hint}
 {mount_hint}
 #![allow(unused_imports)]
 
@@ -795,6 +1340,7 @@ impl CodeGenerator {
 {uses}
 "#,
             mount_hint = mount_hint,
+            source_hint = source_hint,
             decls = module_declarations.join("\n"),
             uses = pub_uses.join("\n"),
         );
@@ -803,30 +1349,54 @@ impl CodeGenerator {
     }
 
     /// Helper method to write all generated files to disk
+    pub fn output_artifacts(
+        &self,
+        result: &GenerationResult,
+    ) -> std::collections::BTreeMap<PathBuf, String> {
+        let mut artifacts = std::collections::BTreeMap::new();
+        for file in &result.files {
+            artifacts.insert(file.path.clone(), file.content.clone());
+        }
+        artifacts.insert(
+            result.mod_file.path.clone(),
+            result.mod_file.content.clone(),
+        );
+        if let Some(mut fragment) =
+            crate::type_mapping::render_required_deps_toml(&result.required_deps)
+        {
+            if let Some(source) = &self.source_provenance {
+                let header = format!(
+                    "# Generated by openapi-to-rust v{}. Source OpenAPI document: {source}",
+                    env!("CARGO_PKG_VERSION")
+                );
+                fragment = fragment.replacen("# Generated by openapi-to-rust.", &header, 1);
+            }
+            artifacts.insert(PathBuf::from("REQUIRED_DEPS.toml"), fragment);
+        }
+        artifacts
+    }
+
+    /// Write a generation result using the same rendered artifact set exposed
+    /// to dry-run and check-mode callers.
     pub fn write_files(&self, result: &GenerationResult) -> Result<()> {
         use std::fs;
 
         // Create output directory if it doesn't exist
         fs::create_dir_all(&self.config.output_dir)?;
 
-        // Write all files
-        for file in &result.files {
-            let file_path = self.config.output_dir.join(&file.path);
-            fs::write(&file_path, &file.content)?;
+        let artifacts = self.output_artifacts(result);
+        for (relative, content) in &artifacts {
+            let file_path = self.config.output_dir.join(relative);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&file_path, content)?;
         }
 
-        // Write mod.rs
-        let mod_path = self.config.output_dir.join(&result.mod_file.path);
-        fs::write(&mod_path, &result.mod_file.content)?;
-
-        // Q2.8: write REQUIRED_DEPS.toml when the generated code
-        // references any optional crates (chrono, uuid, url, …).
-        // Skipped silently when the set is empty so we don't litter
-        // the output dir for specs whose generated types only use
-        // std/serde/serde_json.
-        if let Some(toml) = crate::type_mapping::render_required_deps_toml(&result.required_deps) {
-            let deps_path = self.config.output_dir.join("REQUIRED_DEPS.toml");
-            fs::write(&deps_path, toml)?;
+        let deps_path = self.config.output_dir.join("REQUIRED_DEPS.toml");
+        if !artifacts.contains_key(std::path::Path::new("REQUIRED_DEPS.toml")) && deps_path.exists()
+        {
+            fs::remove_file(&deps_path)?;
         }
 
         Ok(())
@@ -836,7 +1406,7 @@ impl CodeGenerator {
         &self,
         schema: &crate::analysis::AnalyzedSchema,
         analysis: &crate::analysis::SchemaAnalysis,
-        discriminated_variant_info: &BTreeMap<String, DiscriminatedVariantInfo>,
+        type_context: &TypeGenerationContext<'_>,
     ) -> Result<TokenStream> {
         use crate::analysis::SchemaType;
 
@@ -881,7 +1451,7 @@ impl CodeGenerator {
                 required,
                 additional_properties,
                 analysis,
-                discriminated_variant_info.get(&schema.name),
+                type_context,
             ),
             SchemaType::DiscriminatedUnion {
                 discriminator_field,
@@ -943,7 +1513,7 @@ impl CodeGenerator {
 
                 // Check if the item type is a Reference to a discriminator-stripped struct
                 if let SchemaType::Reference { target } = item_type.as_ref() {
-                    if let Some(info) = discriminated_variant_info.get(target) {
+                    if let Some(info) = type_context.discriminated_variants.get(target) {
                         if !info.is_parent_untagged {
                             // Generate a wrapper enum that re-adds the discriminator tag
                             let wrapper_name =
@@ -1295,66 +1865,42 @@ impl CodeGenerator {
         required: &std::collections::HashSet<String>,
         additional_properties: &crate::analysis::ObjectAdditionalProperties,
         analysis: &crate::analysis::SchemaAnalysis,
-        discriminator_info: Option<&DiscriminatedVariantInfo>,
+        type_context: &TypeGenerationContext<'_>,
     ) -> Result<TokenStream> {
         let struct_name = format_ident!("{}", self.to_rust_type_name(&schema.name));
+        let emitted_properties = self.emitted_object_properties(
+            &schema.name,
+            properties,
+            required,
+            additional_properties,
+            analysis,
+            type_context.discriminated_variants.get(&schema.name),
+        );
 
-        // Sort properties by name for deterministic output
-        let mut sorted_properties: Vec<_> = properties.iter().collect();
-        sorted_properties.sort_by_key(|(name, _)| name.as_str());
-
-        // Track Rust field-name uniqueness inside the struct. Two spec
-        // properties whose names sanitize to the same Rust identifier
-        // (e.g. `connectionString` and `connection_string` both → `connection_string`)
-        // would otherwise emit duplicate fields and trigger E0124 / E0062.
-        // We disambiguate by suffixing `_2`, `_3`, … on collisions, and we
-        // skip the duplicate entirely when the spec literally repeats the
-        // same key (impossible in JSON but tolerated in YAML merging).
-        let mut used_field_idents: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        let mut fields: Vec<TokenStream> = sorted_properties
-            .into_iter()
-            .filter(|(field_name, _)| {
-                // Skip the discriminator field ONLY if:
-                // 1. This struct is a variant in a discriminated union, AND
-                // 2. The parent union is tagged (not untagged)
-                if let Some(info) = discriminator_info {
-                    if !info.is_parent_untagged
-                        && field_name.as_str() == info.discriminator_field.as_str()
-                    {
-                        false // Skip the field
-                    } else {
-                        true // Keep the field
-                    }
-                } else {
-                    true // No discriminator info, keep all fields
-                }
-            })
-            .map(|(field_name, prop)| {
-                let raw = self.to_rust_field_name(field_name);
-                let mut chosen = raw.clone();
-                let mut suffix = 2;
-                while !used_field_idents.insert(chosen.clone()) {
-                    chosen = format!("{raw}_{suffix}");
-                    suffix += 1;
-                }
-                let field_ident = Self::to_field_ident(&chosen);
-                let is_required = required.contains(field_name);
-                let field_type =
-                    self.generate_field_type(&schema.name, field_name, prop, is_required, analysis);
-
-                let serde_attrs =
-                    self.generate_serde_field_attrs(field_name, prop, is_required, analysis);
+        let mut fields: Vec<TokenStream> = emitted_properties
+            .iter()
+            .map(|emitted| {
+                let field_name = emitted.wire_name;
+                let property = emitted.property;
+                let field_ident = &emitted.ident;
+                let field_type = &emitted.field_type;
+                let serde_attrs = self.generate_serde_field_attrs(
+                    &schema.name,
+                    field_name,
+                    field_ident,
+                    property,
+                    emitted.is_required,
+                    analysis,
+                );
                 let specta_attrs = self.generate_specta_field_attrs(field_name);
 
-                let doc_comment = if let Some(desc) = &prop.description {
+                let doc_comment = if let Some(desc) = &property.description {
                     let sanitized_desc = self.sanitize_doc_comment(desc);
                     quote! { #[doc = #sanitized_desc] }
                 } else {
                     TokenStream::new()
                 };
-                let constraint_doc = self.generate_constraint_doc(&prop.constraints);
+                let constraint_doc = self.generate_constraint_doc(&property.constraints);
 
                 quote! {
                     #doc_comment
@@ -1399,18 +1945,55 @@ impl CodeGenerator {
             TokenStream::new()
         };
 
+        // Default is safe only when no emitted wire property is required.
+        // Optional fields are represented as Option<T>, and the generated
+        // additional-properties map (when present) is empty by default. We do
+        // not invent values for required data, even when the Rust type itself
+        // happens to implement Default.
+        let can_derive_default = emitted_properties
+            .iter()
+            .all(|property| !property.is_required);
+
         // Generate derives with optional Specta support
         // Note: We use snake_case everywhere (matching the OpenAPI spec) for consistency
         // between Rust, JSON API, and TypeScript
-        let derives = if self.config.enable_specta {
-            quote! {
+        let derives = match (self.config.enable_specta, can_derive_default) {
+            (true, true) => quote! {
+                #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+                #[cfg_attr(feature = "specta", derive(specta::Type))]
+            },
+            (true, false) => quote! {
                 #[derive(Debug, Clone, Deserialize, Serialize)]
                 #[cfg_attr(feature = "specta", derive(specta::Type))]
-            }
-        } else {
-            quote! {
+            },
+            (false, true) => quote! {
+                #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+            },
+            (false, false) => quote! {
                 #[derive(Debug, Clone, Deserialize, Serialize)]
-            }
+            },
+        };
+
+        let builder = if type_context.index.request_body_roots.contains(&schema.name)
+            && emitted_properties
+                .iter()
+                .any(|property| property.is_required)
+            && (emitted_properties
+                .iter()
+                .any(|property| !property.is_required)
+                || !matches!(
+                    additional_properties,
+                    crate::analysis::ObjectAdditionalProperties::Forbidden
+                )) {
+            self.generate_request_model_builder(
+                schema,
+                &emitted_properties,
+                additional_properties,
+                analysis,
+                type_context.index,
+            )
+        } else {
+            TokenStream::new()
         };
 
         Ok(quote! {
@@ -1419,7 +2002,276 @@ impl CodeGenerator {
             pub struct #struct_name {
                 #(#fields)*
             }
+
+            #builder
         })
+    }
+
+    /// Project an object schema into the exact public fields emitted in
+    /// `types.rs`. Request-model and operation builders share this metadata so
+    /// identifier disambiguation, discriminator filtering, and Option wrapping
+    /// cannot drift.
+    pub(crate) fn emitted_object_properties<'a>(
+        &self,
+        schema_name: &str,
+        properties: &'a BTreeMap<String, crate::analysis::PropertyInfo>,
+        required: &std::collections::HashSet<String>,
+        additional_properties: &crate::analysis::ObjectAdditionalProperties,
+        analysis: &crate::analysis::SchemaAnalysis,
+        discriminator_info: Option<&DiscriminatedVariantInfo>,
+    ) -> Vec<EmittedObjectProperty<'a>> {
+        let mut sorted_properties: Vec<_> = properties.iter().collect();
+        sorted_properties.sort_by_key(|(name, _)| name.as_str());
+
+        let mut used_field_idents = std::collections::HashSet::new();
+        if !matches!(
+            additional_properties,
+            crate::analysis::ObjectAdditionalProperties::Forbidden
+        ) {
+            used_field_idents.insert("additional_properties".to_string());
+        }
+
+        let mut emitted = Vec::new();
+        for (field_name, property) in sorted_properties {
+            if discriminator_info.is_some_and(|info| {
+                !info.is_parent_untagged && field_name.as_str() == info.discriminator_field.as_str()
+            }) {
+                continue;
+            }
+
+            let raw = self.to_rust_field_name(field_name);
+            let mut chosen = raw.clone();
+            let mut suffix = 2;
+            while !used_field_idents.insert(chosen.clone()) {
+                chosen = format!("{raw}_{suffix}");
+                suffix += 1;
+            }
+            let is_required = required.contains(field_name);
+            emitted.push(EmittedObjectProperty {
+                wire_name: field_name,
+                property,
+                ident: Self::to_field_ident(&chosen),
+                is_required,
+                field_type: self.generate_field_type(
+                    schema_name,
+                    field_name,
+                    property,
+                    is_required,
+                    analysis,
+                ),
+            });
+        }
+        emitted
+    }
+
+    fn type_generation_index(
+        &self,
+        analysis: &crate::analysis::SchemaAnalysis,
+    ) -> TypeGenerationIndex {
+        let reserved_type_names = analysis
+            .schemas
+            .keys()
+            .map(|name| self.to_rust_type_name(name))
+            .collect();
+        let mut request_body_roots = std::collections::HashSet::new();
+        for operation in analysis.operations.values() {
+            let Some(mut current) = operation
+                .request_body
+                .as_ref()
+                .and_then(crate::analysis::RequestBodyContent::schema_name)
+            else {
+                continue;
+            };
+            while request_body_roots.insert(current.to_string()) {
+                let Some(crate::analysis::AnalyzedSchema {
+                    schema_type: crate::analysis::SchemaType::Reference { target },
+                    ..
+                }) = analysis.schemas.get(current)
+                else {
+                    break;
+                };
+                current = target;
+            }
+        }
+        TypeGenerationIndex {
+            request_body_roots,
+            reserved_type_names,
+        }
+    }
+
+    fn generate_request_model_builder(
+        &self,
+        schema: &crate::analysis::AnalyzedSchema,
+        properties: &[EmittedObjectProperty<'_>],
+        additional_properties: &crate::analysis::ObjectAdditionalProperties,
+        analysis: &crate::analysis::SchemaAnalysis,
+        type_index: &TypeGenerationIndex,
+    ) -> TokenStream {
+        let struct_name = format_ident!("{}", self.to_rust_type_name(&schema.name));
+        let builder_base = format!("{}Builder", struct_name);
+        let mut builder_name = builder_base.clone();
+        let mut suffix = 2;
+        while type_index.reserved_type_names.contains(&builder_name) {
+            builder_name = format!("{builder_base}{suffix}");
+            suffix += 1;
+        }
+        let builder_name = format_ident!("{builder_name}");
+
+        let required_parameters: Vec<TokenStream> = properties
+            .iter()
+            .filter(|property| property.is_required)
+            .map(|property| {
+                let ident = &property.ident;
+                let field_type = &property.field_type;
+                quote! { #ident: #field_type }
+            })
+            .collect();
+        let required_idents: Vec<&syn::Ident> = properties
+            .iter()
+            .filter(|property| property.is_required)
+            .map(|property| &property.ident)
+            .collect();
+        let optional_initializers: Vec<TokenStream> = properties
+            .iter()
+            .filter(|property| !property.is_required)
+            .map(|property| {
+                let ident = &property.ident;
+                quote! { #ident: None }
+            })
+            .collect();
+
+        let additional_initializer = match additional_properties {
+            crate::analysis::ObjectAdditionalProperties::Forbidden => TokenStream::new(),
+            crate::analysis::ObjectAdditionalProperties::Untyped
+            | crate::analysis::ObjectAdditionalProperties::Typed { .. } => quote! {
+                additional_properties: ::std::collections::BTreeMap::new(),
+            },
+        };
+
+        let mut used_builder_methods =
+            std::collections::HashSet::from(["new".to_string(), "build".to_string()]);
+        if !matches!(
+            additional_properties,
+            crate::analysis::ObjectAdditionalProperties::Forbidden
+        ) {
+            used_builder_methods.insert("additional_properties".to_string());
+        }
+        let optional_setters: Vec<TokenStream> = properties
+            .iter()
+            .filter(|property| !property.is_required)
+            .map(|property| {
+                let field_ident = &property.ident;
+                let field_type = self.generate_property_base_type(
+                    &schema.name,
+                    property.wire_name,
+                    property.property,
+                    analysis,
+                );
+                // Allocate every setter in the builder's method namespace.
+                // `new` and `build` keep their documented `with_` escape;
+                // further collisions receive deterministic numeric suffixes.
+                let field_name = field_ident.to_string();
+                let plain_field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
+                let mut setter_name = if matches!(plain_field_name, "new" | "build") {
+                    format!("with_{plain_field_name}")
+                } else {
+                    field_name.clone()
+                };
+                let setter_base = setter_name.clone();
+                let mut suffix = 2;
+                while !used_builder_methods.insert(setter_name.clone()) {
+                    setter_name = format!("{setter_base}_{suffix}");
+                    suffix += 1;
+                }
+                let setter_ident = Self::to_field_ident(&setter_name);
+                let wire_name = property.wire_name;
+                quote! {
+                    #[doc = concat!("Set the optional `", #wire_name, "` request field.")]
+                    #[must_use]
+                    pub fn #setter_ident(mut self, #field_ident: #field_type) -> Self {
+                        self.value.#field_ident = Some(#field_ident);
+                        self
+                    }
+                }
+            })
+            .collect();
+
+        let additional_setter = match additional_properties {
+            crate::analysis::ObjectAdditionalProperties::Forbidden => TokenStream::new(),
+            crate::analysis::ObjectAdditionalProperties::Untyped => quote! {
+                /// Replace the request's additional properties.
+                #[must_use]
+                pub fn additional_properties(
+                    mut self,
+                    additional_properties: ::std::collections::BTreeMap<
+                        String,
+                        serde_json::Value,
+                    >,
+                ) -> Self {
+                    self.value.additional_properties = additional_properties;
+                    self
+                }
+            },
+            crate::analysis::ObjectAdditionalProperties::Typed { value_type } => {
+                let value_type = self.generate_array_item_type(value_type, analysis);
+                quote! {
+                    /// Replace the request's additional properties.
+                    #[must_use]
+                    pub fn additional_properties(
+                        mut self,
+                        additional_properties: ::std::collections::BTreeMap<
+                            String,
+                            #value_type,
+                        >,
+                    ) -> Self {
+                        self.value.additional_properties = additional_properties;
+                        self
+                    }
+                }
+            }
+        };
+
+        quote! {
+            impl #struct_name {
+                /// Construct this request with every required wire field.
+                pub fn new(#(#required_parameters),*) -> Self {
+                    Self {
+                        #(#required_idents,)*
+                        #(#optional_initializers,)*
+                        #additional_initializer
+                    }
+                }
+
+                /// Start a dependency-free builder with every required wire field.
+                pub fn builder(#(#required_parameters),*) -> #builder_name {
+                    #builder_name::new(#(#required_idents),*)
+                }
+            }
+
+            /// Dependency-free builder for [`#struct_name`].
+            #[derive(Debug, Clone)]
+            #[must_use]
+            pub struct #builder_name {
+                value: #struct_name,
+            }
+
+            impl #builder_name {
+                /// Start a builder with every required wire field.
+                pub fn new(#(#required_parameters),*) -> Self {
+                    Self {
+                        value: #struct_name::new(#(#required_idents),*),
+                    }
+                }
+
+                #(#optional_setters)*
+                #additional_setter
+
+                /// Finish building the request model.
+                pub fn build(self) -> #struct_name {
+                    self.value
+                }
+            }
+        }
     }
 
     fn generate_discriminated_enum(
@@ -1775,9 +2627,47 @@ impl CodeGenerator {
         is_required: bool,
         analysis: &crate::analysis::SchemaAnalysis,
     ) -> TokenStream {
+        let base_type = self.generate_property_base_type(schema_name, field_name, prop, analysis);
+
+        if self.property_is_option_wrapped(schema_name, field_name, prop, is_required, analysis) {
+            quote! { Option<#base_type> }
+        } else {
+            base_type
+        }
+    }
+
+    fn property_is_option_wrapped(
+        &self,
+        schema_name: &str,
+        field_name: &str,
+        prop: &crate::analysis::PropertyInfo,
+        is_required: bool,
+        analysis: &crate::analysis::SchemaAnalysis,
+    ) -> bool {
+        let override_key = format!("{schema_name}.{field_name}");
+        let is_nullable_override = self
+            .config
+            .nullable_field_overrides
+            .get(&override_key)
+            .copied()
+            .unwrap_or(false);
+
+        !is_required
+            || prop.nullable
+            || is_nullable_override
+            || (prop.default.is_some() && self.type_lacks_default(&prop.schema_type, analysis))
+    }
+
+    pub(crate) fn generate_property_base_type(
+        &self,
+        schema_name: &str,
+        _field_name: &str,
+        prop: &crate::analysis::PropertyInfo,
+        analysis: &crate::analysis::SchemaAnalysis,
+    ) -> TokenStream {
         use crate::analysis::SchemaType;
 
-        let base_type = match &prop.schema_type {
+        match &prop.schema_type {
             SchemaType::Primitive { rust_type, .. } => {
                 // syn handles generics + complex paths
                 // (chrono::DateTime<chrono::Utc>, Vec<u8>, …).
@@ -1829,33 +2719,14 @@ impl CodeGenerator {
                 // Fallback for complex types
                 quote! { serde_json::Value }
             }
-        };
-
-        // Check if this field has a nullable override
-        let override_key = format!("{schema_name}.{field_name}");
-        let is_nullable_override = self
-            .config
-            .nullable_field_overrides
-            .get(&override_key)
-            .copied()
-            .unwrap_or(false);
-
-        if is_required && !prop.nullable && !is_nullable_override {
-            // If the field has a default value but its type doesn't implement Default,
-            // wrap in Option<T> so serde can default to None instead of requiring Default.
-            if prop.default.is_some() && self.type_lacks_default(&prop.schema_type, analysis) {
-                quote! { Option<#base_type> }
-            } else {
-                base_type
-            }
-        } else {
-            quote! { Option<#base_type> }
         }
     }
 
     fn generate_serde_field_attrs(
         &self,
+        schema_name: &str,
         field_name: &str,
+        field_ident: &syn::Ident,
         prop: &crate::analysis::PropertyInfo,
         is_required: bool,
         analysis: &crate::analysis::SchemaAnalysis,
@@ -1864,7 +2735,7 @@ impl CodeGenerator {
 
         // Generate rename attribute if field name differs from Rust identifier
         // Strip r# prefix for comparison since serde handles raw idents transparently
-        let rust_field_name = self.to_rust_field_name(field_name);
+        let rust_field_name = field_ident.to_string();
         let comparison_name = rust_field_name
             .strip_prefix("r#")
             .unwrap_or(&rust_field_name);
@@ -1899,16 +2770,26 @@ impl CodeGenerator {
             ..
         } = &prop.schema_type
         {
-            // Mirrors the wrapping logic in generate_field_type:
-            // the field is Option<T> when the schema marks it
-            // optional or nullable.
-            let is_option_wrapped = !is_required || prop.nullable;
+            let is_option_wrapped = self.property_is_option_wrapped(
+                schema_name,
+                field_name,
+                prop,
+                is_required,
+                analysis,
+            );
             let codec_path = if is_option_wrapped {
                 format!("{codec}::option")
             } else {
                 codec.clone()
             };
             attrs.push(quote! { with = #codec_path });
+            // A `with` codec disables serde's implicit
+            // missing-field → None handling for Option fields
+            // (serde-rs/serde#2878); without `default` a request
+            // that simply omits the field fails to deserialize.
+            if is_option_wrapped {
+                attrs.push(quote! { default });
+            }
         }
 
         if attrs.is_empty() {
@@ -2224,98 +3105,10 @@ impl CodeGenerator {
     }
 
     pub(crate) fn to_rust_type_name(&self, s: &str) -> String {
-        // Convert string to valid Rust type name (PascalCase)
-        let mut result = String::new();
-        let mut next_upper = true;
-        let mut prev_was_lower = false;
-
-        for c in s.chars() {
-            match c {
-                'a'..='z' => {
-                    if next_upper {
-                        result.push(c.to_ascii_uppercase());
-                        next_upper = false;
-                    } else {
-                        result.push(c);
-                    }
-                    prev_was_lower = true;
-                }
-                'A'..='Z' => {
-                    result.push(c);
-                    next_upper = false;
-                    prev_was_lower = false;
-                }
-                '0'..='9' => {
-                    // If previous was lowercase letter and this is start of a number sequence,
-                    // make it uppercase to improve readability (e.g., Tool20241022 instead of Tool20241022)
-                    if prev_was_lower && !result.chars().last().unwrap_or(' ').is_ascii_digit() {
-                        // This is fine as-is, the number follows naturally
-                    }
-                    result.push(c);
-                    next_upper = false;
-                    prev_was_lower = false;
-                }
-                '_' | '-' | '.' | ' ' => {
-                    // Skip underscore/separator and make next char uppercase
-                    next_upper = true;
-                    prev_was_lower = false;
-                }
-                _ => {
-                    // Other special characters - treat as word boundary
-                    next_upper = true;
-                    prev_was_lower = false;
-                }
-            }
-        }
-
-        // Handle empty result
-        if result.is_empty() {
-            result = "Type".to_string();
-        }
-
-        // Ensure type name starts with a letter (not a number)
-        if result.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            result = format!("Type{result}");
-        }
-
-        // Avoid masking ubiquitous std types and traits. cloudflare has a
-        // schema literally named `Result`, gcore has `Default`; emitting
-        // `pub enum Result { ... }` shadows std::result::Result and breaks
-        // every method's `-> Result<T, ApiOpError<...>>`. Same for impls
-        // like `impl Default for HttpClient { ... }` when `Default` resolves
-        // to the local type alias.
-        if matches!(
-            result.as_str(),
-            "Result"
-                | "Option"
-                | "Box"
-                | "Vec"
-                | "String"
-                | "Some"
-                | "None"
-                | "Ok"
-                | "Err"
-                | "Default"
-                | "Clone"
-                | "Debug"
-                | "Send"
-                | "Sync"
-                | "Sized"
-                | "Iterator"
-                | "From"
-                | "Into"
-                | "TryFrom"
-                | "TryInto"
-                | "AsRef"
-                | "AsMut"
-        ) {
-            result.push_str("Type");
-        }
-
-        result
+        rust_type_name(s)
     }
 
-    fn to_rust_field_name(&self, s: &str) -> String {
+    pub(crate) fn to_rust_field_name(&self, s: &str) -> String {
         // Track sign / leading-non-alpha so e.g. `+1` and `-1` produce
         // distinct field names instead of both collapsing to `field_1`
         // (observed in github.json's reactions schemas).
@@ -2785,6 +3578,8 @@ impl CodeGenerator {
                 Api(String),
                 #[error("Timeout error: {0}")]
                 Timeout(String),
+                #[error("Response body exceeded configured limit of {limit} bytes")]
+                ResponseTooLarge { limit: usize },
                 #[error("JSON serialization/deserialization error: {0}")]
                 Json(#[from] serde_json::Error),
                 #[error("Request error: {0}")]
@@ -2902,7 +3697,7 @@ impl CodeGenerator {
         let mut struct_fields = vec![
             quote! { base_url: String },
             quote! { api_key: Option<String> },
-            quote! { http_client: reqwest::Client },
+            quote! { sse_client: SseClient },
             quote! { custom_headers: std::collections::BTreeMap<String, String> },
         ];
 
@@ -2927,13 +3722,41 @@ impl CodeGenerator {
         } else {
             "https://api.example.com"
         };
+        let max_response_body_bytes = self
+            .config()
+            .http_client_config
+            .as_ref()
+            .and_then(|http| http.max_response_body_bytes)
+            .unwrap_or(8 * 1024 * 1024);
+        let sse_client_initializer = if let Some(reconnect) = &streaming_config.reconnection_config
+        {
+            let max_retries = reconnect.max_retries;
+            let initial_delay_ms = reconnect.initial_delay_ms;
+            let max_delay_ms = reconnect.max_delay_ms;
+            let backoff_multiplier = reconnect.backoff_multiplier;
+            quote! {
+                SseClient::new()
+                    .with_max_error_body_bytes(#max_response_body_bytes)
+                    .with_reconnect_options(SseReconnectOptions {
+                        max_retries: #max_retries,
+                        initial_retry_delay: std::time::Duration::from_millis(#initial_delay_ms),
+                        max_retry_delay: std::time::Duration::from_millis(#max_delay_ms),
+                        backoff_multiplier: #backoff_multiplier,
+                    })
+            }
+        } else {
+            quote! {
+                SseClient::new()
+                    .with_max_error_body_bytes(#max_response_body_bytes)
+            }
+        };
 
         // Build constructor fields based on what the struct has
         let constructor_fields = if has_optional_headers {
             quote! {
                 base_url: #default_base_url.to_string(),
                 api_key: None,
-                http_client: reqwest::Client::new(),
+                sse_client: #sse_client_initializer,
                 custom_headers: std::collections::BTreeMap::new(),
                 optional_headers: std::collections::BTreeMap::new(),
             }
@@ -2941,7 +3764,7 @@ impl CodeGenerator {
             quote! {
                 base_url: #default_base_url.to_string(),
                 api_key: None,
-                http_client: reqwest::Client::new(),
+                sse_client: #sse_client_initializer,
                 custom_headers: std::collections::BTreeMap::new(),
             }
         };
@@ -2979,6 +3802,12 @@ impl CodeGenerator {
                     self
                 }
 
+                /// Set the maximum number of error-response bytes buffered in memory.
+                pub fn with_max_response_body_bytes(mut self, limit: usize) -> Self {
+                    self.sse_client = self.sse_client.with_max_error_body_bytes(limit);
+                    self
+                }
+
                 /// Add a custom header to all requests
                 pub fn with_header(
                     mut self,
@@ -2991,7 +3820,7 @@ impl CodeGenerator {
 
                 /// Set the HTTP client
                 pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
-                    self.http_client = client;
+                    self.sse_client = self.sse_client.with_http_client(client);
                     self
                 }
 
@@ -3192,14 +4021,17 @@ impl CodeGenerator {
                     let url_str = url.to_string();
                     debug!("Making streaming GET request to: {}", url_str);
 
-                    let request_builder = self.http_client
+                    let request_builder = self.sse_client
                         .get(url_str)
                         .headers(headers);
 
                     debug!("Creating SSE stream from request");
-                    let stream = parse_sse_stream::<#event_type>(request_builder).await?;
+                    let stream = self
+                        .sse_client
+                        .stream::<#event_type>(request_builder)
+                        .await?;
                     info!("SSE stream created successfully");
-                    Ok(Box::pin(stream))
+                    Ok(stream)
                 }
             }
         })
@@ -3281,131 +4113,742 @@ impl CodeGenerator {
                     #url_construction
                     debug!("Making streaming POST request to: {}", url);
 
-                    let request_builder = self.http_client
+                    let request_builder = self.sse_client
                         .post(&url)
                         .headers(headers)
                         .json(&streaming_request);
 
                     debug!("Creating SSE stream from request");
-                    let stream = parse_sse_stream::<#event_type>(request_builder).await?;
+                    let stream = self
+                        .sse_client
+                        .stream::<#event_type>(request_builder)
+                        .await?;
                     info!("SSE stream created successfully");
-                    Ok(Box::pin(stream))
+                    Ok(stream)
                 }
             }
         })
     }
 
-    /// Generate SSE parsing utilities using reqwest-eventsource
-    fn generate_sse_parser_utilities(
-        &self,
-        _streaming_config: &crate::streaming::StreamingConfig,
-    ) -> Result<TokenStream> {
+    /// Generate the reusable SSE transport module emitted as `sse.rs`.
+    fn generate_sse_runtime(&self) -> Result<String> {
+        let provenance_attribute = self.provenance_attribute();
+        let error_types = self.generate_streaming_error_types()?;
+        let parser = self.generate_sse_parser_utilities()?;
+        let tokens = quote! {
+            //! Generated SSE transport, framing, and JSON decoding support.
+            //!
+            //! This module is emitted only when SSE generation is enabled.
+            #provenance_attribute
+            #![allow(clippy::format_in_format_args)]
+
+            use futures_util::{Stream, StreamExt};
+            use std::pin::Pin;
+            use std::time::Duration;
+            use tracing::debug;
+
+            #error_types
+
+            /// Reusable transport client for generated SSE operations.
+            #[derive(Debug, Clone)]
+            pub struct SseClient {
+                http_client: reqwest::Client,
+                max_error_body_bytes: usize,
+                reconnect_options: Option<SseReconnectOptions>,
+            }
+
+            impl SseClient {
+                pub fn new() -> Self {
+                    Self {
+                        http_client: reqwest::Client::new(),
+                        max_error_body_bytes: DEFAULT_MAX_SSE_ERROR_BODY_BYTES,
+                        reconnect_options: None,
+                    }
+                }
+
+                pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+                    self.http_client = client;
+                    self
+                }
+
+                pub fn with_max_error_body_bytes(mut self, limit: usize) -> Self {
+                    self.max_error_body_bytes = limit;
+                    self
+                }
+
+                /// Enable automatic reconnection for [`Self::stream`].
+                pub fn with_reconnect_options(mut self, options: SseReconnectOptions) -> Self {
+                    self.reconnect_options = Some(options);
+                    self
+                }
+
+                pub fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+                    self.http_client.get(url)
+                }
+
+                pub fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+                    self.http_client.post(url)
+                }
+
+                pub async fn stream<T>(
+                    &self,
+                    request_builder: reqwest::RequestBuilder,
+                ) -> Result<Pin<Box<dyn Stream<Item = Result<T, StreamingError>> + Send>>, StreamingError>
+                where
+                    T: serde::de::DeserializeOwned + Send + 'static,
+                {
+                    if let Some(options) = self.reconnect_options.clone() {
+                        parse_sse_json_reconnecting_with_limit(
+                            request_builder,
+                            self.max_error_body_bytes,
+                            options,
+                        ).await
+                    } else {
+                        parse_sse_json_stream_with_limit(
+                            request_builder,
+                            self.max_error_body_bytes,
+                        ).await
+                    }
+                }
+
+                /// Stream raw SSE events from one HTTP connection.
+                pub async fn stream_raw(
+                    &self,
+                    request_builder: reqwest::RequestBuilder,
+                ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<String>, StreamingError>> + Send>>, StreamingError> {
+                    parse_sse_raw_stream_with_limit(request_builder, self.max_error_body_bytes).await
+                }
+
+                /// Stream typed JSON SSE events from one HTTP connection.
+                pub async fn stream_json<T>(
+                    &self,
+                    request_builder: reqwest::RequestBuilder,
+                ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<T>, StreamingError>> + Send>>, StreamingError>
+                where
+                    T: serde::de::DeserializeOwned + Send + 'static,
+                {
+                    parse_sse_json_events_with_limit(request_builder, self.max_error_body_bytes).await
+                }
+
+                /// Stream raw SSE events and reconnect retryable connections.
+                pub async fn stream_raw_reconnecting(
+                    &self,
+                    request_builder: reqwest::RequestBuilder,
+                ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<String>, StreamingError>> + Send>>, StreamingError> {
+                    parse_sse_raw_reconnecting_with_limit(
+                        request_builder,
+                        self.max_error_body_bytes,
+                        self.reconnect_options.clone().unwrap_or_default(),
+                    ).await
+                }
+
+                /// Stream typed JSON SSE events and reconnect retryable connections.
+                pub async fn stream_json_reconnecting<T>(
+                    &self,
+                    request_builder: reqwest::RequestBuilder,
+                ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<T>, StreamingError>> + Send>>, StreamingError>
+                where
+                    T: serde::de::DeserializeOwned + Send + 'static,
+                {
+                    parse_sse_json_reconnecting_events_with_limit(
+                        request_builder,
+                        self.max_error_body_bytes,
+                        self.reconnect_options.clone().unwrap_or_default(),
+                    ).await
+                }
+            }
+
+            impl Default for SseClient {
+                fn default() -> Self {
+                    Self::new()
+                }
+            }
+
+            #parser
+        };
+        let syntax_tree = syn::parse2::<syn::File>(tokens).map_err(|error| {
+            GeneratorError::CodeGenError(format!("Failed to parse generated sse.rs: {error}"))
+        })?;
+        Ok(prettyplease::unparse(&syntax_tree))
+    }
+
+    /// Generate the standalone SSE framing and JSON parsing utilities.
+    fn generate_sse_parser_utilities(&self) -> Result<TokenStream> {
         Ok(quote! {
-            /// Parse SSE stream from HTTP request using reqwest-eventsource
+            /// Default upper bound for an SSE error response buffered in memory.
+            pub const DEFAULT_MAX_SSE_ERROR_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+            async fn __read_bounded_streaming_error_body(
+                mut response: reqwest::Response,
+                limit: usize,
+            ) -> Result<Vec<u8>, StreamingError> {
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await? {
+                    let next_len = body.len().checked_add(chunk.len());
+                    if next_len.is_none_or(|next_len| next_len > limit) {
+                        return Err(StreamingError::ResponseTooLarge { limit });
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(body)
+            }
+
+            /// A decoded SSE event with its transport metadata preserved.
+            #[derive(Debug, Clone, PartialEq, Eq)]
+            pub struct SseEvent<T> {
+                /// Event name, or `message` when the server omitted `event:`.
+                pub event: String,
+                /// Raw or deserialized event payload.
+                pub data: T,
+                /// Most recent event ID, used to resume a reconnected stream.
+                pub id: Option<String>,
+                /// Server-supplied reconnection delay on this event, if present.
+                pub retry: Option<Duration>,
+            }
+
+            /// Controls automatic SSE reconnection behavior.
+            #[derive(Debug, Clone)]
+            pub struct SseReconnectOptions {
+                /// Maximum consecutive reconnection attempts.
+                pub max_retries: u32,
+                /// Delay before the first reconnection when the server did not send `retry:`.
+                pub initial_retry_delay: Duration,
+                /// Upper bound for client-computed and server-supplied delays.
+                pub max_retry_delay: Duration,
+                /// Exponential backoff multiplier for consecutive failures.
+                pub backoff_multiplier: f64,
+            }
+
+            impl Default for SseReconnectOptions {
+                fn default() -> Self {
+                    Self {
+                        max_retries: 3,
+                        initial_retry_delay: Duration::from_secs(3),
+                        max_retry_delay: Duration::from_secs(30),
+                        backoff_multiplier: 2.0,
+                    }
+                }
+            }
+
+            impl SseReconnectOptions {
+                fn delay(&self, attempt: u32, server_retry: Option<Duration>) -> Duration {
+                    if let Some(delay) = server_retry {
+                        return delay.min(self.max_retry_delay);
+                    }
+                    let multiplier = self.backoff_multiplier.max(1.0);
+                    let millis = self.initial_retry_delay.as_millis() as f64
+                        * multiplier.powi(attempt.min(63) as i32);
+                    Duration::from_millis(
+                        millis.min(self.max_retry_delay.as_millis() as f64) as u64,
+                    )
+                }
+            }
+
+            #[derive(Default)]
+            struct __SseDecoder {
+                line: Vec<u8>,
+                event: String,
+                data: Vec<String>,
+                last_event_id: Option<String>,
+                retry_delay: Option<Duration>,
+                event_retry: Option<Duration>,
+                saw_carriage_return: bool,
+            }
+
+            impl __SseDecoder {
+                fn feed(
+                    &mut self,
+                    chunk: &[u8],
+                ) -> Vec<Result<SseEvent<String>, StreamingError>> {
+                    let mut messages = Vec::new();
+                    for &byte in chunk {
+                        if self.saw_carriage_return {
+                            self.saw_carriage_return = false;
+                            if byte == b'\n' {
+                                continue;
+                            }
+                        }
+
+                        match byte {
+                            b'\n' => self.finish_line(&mut messages),
+                            b'\r' => {
+                                self.finish_line(&mut messages);
+                                self.saw_carriage_return = true;
+                            }
+                            _ => self.line.push(byte),
+                        }
+                    }
+                    messages
+                }
+
+                fn finish(&mut self) -> Vec<Result<SseEvent<String>, StreamingError>> {
+                    let mut messages = Vec::new();
+                    if !self.line.is_empty() {
+                        self.finish_line(&mut messages);
+                    }
+                    self.dispatch(&mut messages);
+                    messages
+                }
+
+                fn finish_line(
+                    &mut self,
+                    messages: &mut Vec<Result<SseEvent<String>, StreamingError>>,
+                ) {
+                    let line = std::mem::take(&mut self.line);
+                    let line = match String::from_utf8(line) {
+                        Ok(line) => line,
+                        Err(error) => {
+                            messages.push(Err(StreamingError::Parsing(format!(
+                                "SSE line is not valid UTF-8: {}",
+                                error
+                            ))));
+                            return;
+                        }
+                    };
+
+                    if line.is_empty() {
+                        self.dispatch(messages);
+                        return;
+                    }
+                    if line.starts_with(':') {
+                        return;
+                    }
+
+                    let (field, value) = line
+                        .split_once(':')
+                        .map_or((line.as_str(), ""), |(field, value)| {
+                            (field, value.strip_prefix(' ').unwrap_or(value))
+                        });
+                    match field {
+                        "event" => self.event = value.to_string(),
+                        "data" => self.data.push(value.to_string()),
+                        "id" if !value.contains('\0') => {
+                            self.last_event_id = (!value.is_empty()).then(|| value.to_string());
+                        }
+                        "retry" if value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                            if let Ok(milliseconds) = value.parse::<u64>() {
+                                let delay = Duration::from_millis(milliseconds);
+                                self.retry_delay = Some(delay);
+                                self.event_retry = Some(delay);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                fn dispatch(
+                    &mut self,
+                    messages: &mut Vec<Result<SseEvent<String>, StreamingError>>,
+                ) {
+                    if self.data.is_empty() {
+                        self.event.clear();
+                        self.event_retry = None;
+                        return;
+                    }
+                    messages.push(Ok(SseEvent {
+                        event: if self.event.is_empty() {
+                            "message".to_string()
+                        } else {
+                            std::mem::take(&mut self.event)
+                        },
+                        data: std::mem::take(&mut self.data).join("\n"),
+                        id: self.last_event_id.clone(),
+                        retry: self.event_retry.take(),
+                    }));
+                    self.event.clear();
+                }
+
+                fn reset_for_reconnect(&mut self) {
+                    self.line.clear();
+                    self.event.clear();
+                    self.data.clear();
+                    self.event_retry = None;
+                    self.saw_carriage_return = false;
+                }
+            }
+
+            fn __deserialize_sse_event<T>(
+                event: SseEvent<String>,
+            ) -> Option<Result<SseEvent<T>, StreamingError>>
+            where
+                T: serde::de::DeserializeOwned,
+            {
+                if event.data.trim() == "[DONE]" {
+                    return None;
+                }
+                if event.event == "ping" {
+                    debug!("Received SSE ping event, skipping");
+                    return None;
+                }
+                if event.data.trim().is_empty() {
+                    debug!("Empty SSE data, skipping");
+                    return None;
+                }
+
+                let json_value = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Some(Err(StreamingError::Parsing(format!(
+                            "SSE event is not valid JSON: {} ({})",
+                            event.data, error
+                        ))));
+                    }
+                };
+                let is_ping = json_value
+                    .get("event")
+                    .or_else(|| json_value.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|event| event == "ping");
+                if is_ping {
+                    debug!("Received ping event in JSON data, skipping");
+                    return None;
+                }
+
+                Some(
+                    serde_json::from_value::<T>(json_value)
+                        .map(|data| SseEvent {
+                            event: event.event.clone(),
+                            data,
+                            id: event.id.clone(),
+                            retry: event.retry,
+                        })
+                        .map_err(|error| StreamingError::Parsing(format!(
+                            "Failed to parse SSE event: {} (raw: {}, event: {})",
+                            error, event.data, event.event
+                        ))),
+                )
+            }
+
+            /// Parse an SSE response without an external EventSource wrapper.
             pub async fn parse_sse_stream<T>(
                 request_builder: reqwest::RequestBuilder
-            ) -> Result<impl Stream<Item = Result<T, StreamingError>>, StreamingError>
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<T, StreamingError>> + Send>>, StreamingError>
             where
                 T: serde::de::DeserializeOwned + Send + 'static,
             {
-                let mut event_source = reqwest_eventsource::EventSource::new(request_builder).map_err(|e| {
-                    StreamingError::Connection(format!("Failed to create event source: {}", e))
+                parse_sse_json_stream_with_limit(
+                    request_builder,
+                    DEFAULT_MAX_SSE_ERROR_BODY_BYTES,
+                ).await
+            }
+
+            struct __SseOpenError {
+                error: StreamingError,
+                retryable: bool,
+            }
+
+            async fn __open_sse_response(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+            ) -> Result<reqwest::Response, __SseOpenError> {
+                let response = request_builder.send().await.map_err(|error| __SseOpenError {
+                    error: error.into(),
+                    retryable: true,
                 })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    let error = match __read_bounded_streaming_error_body(
+                        response,
+                        max_response_body_bytes,
+                    ).await {
+                        Ok(body) => StreamingError::Connection(format!(
+                            "HTTP {} error: {}",
+                            status.as_u16(),
+                            String::from_utf8_lossy(&body)
+                        )),
+                        Err(error) => error,
+                    };
+                    return Err(__SseOpenError { error, retryable });
+                }
 
-                let stream = event_source.filter_map(|event_result| async move {
-                    match event_result {
-                        Ok(reqwest_eventsource::Event::Open) => {
-                            debug!("SSE connection opened");
-                            None
-                        }
-                        Ok(reqwest_eventsource::Event::Message(message)) => {
-                            // Check if this is a ping event by SSE event type
-                            if message.event == "ping" {
-                                debug!("Received SSE ping event, skipping");
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                if !content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+                {
+                    let error = StreamingError::Parsing(format!(
+                        "Expected text/event-stream response, received {}",
+                        if content_type.is_empty() { "no Content-Type" } else { content_type }
+                    ));
+                    return Err(__SseOpenError { error, retryable: false });
+                }
+
+                debug!("SSE connection opened");
+                Ok(response)
+            }
+
+            fn __raw_response_stream(
+                response: reqwest::Response,
+            ) -> Pin<Box<dyn Stream<Item = Result<SseEvent<String>, StreamingError>> + Send>> {
+                let stream = futures_util::stream::unfold(
+                    (
+                        response,
+                        __SseDecoder::default(),
+                        std::collections::VecDeque::<Result<SseEvent<String>, StreamingError>>::new(),
+                        false,
+                    ),
+                    |(mut response, mut decoder, mut pending, mut done)| async move {
+                        loop {
+                            if let Some(item) = pending.pop_front() {
+                                return Some((item, (response, decoder, pending, done)));
+                            }
+                            if done {
+                                debug!("SSE stream completed normally");
                                 return None;
                             }
 
-                            // Special handling for empty data
-                            if message.data.trim().is_empty() {
-                                debug!("Empty SSE data, skipping");
-                                return None;
-                            }
-
-                            // Check if this is a ping event in the JSON data
-                            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&message.data) {
-                                if let Some(event_type) = json_value.get("event").and_then(|v| v.as_str()) {
-                                    if event_type == "ping" {
-                                        debug!("Received ping event in JSON data, skipping");
-                                        return None;
-                                    }
-                                }
-
-                                // Try to parse the full event normally
-                                match serde_json::from_value::<T>(json_value) {
-                                    Ok(parsed_event) => {
-                                        Some(Ok(parsed_event))
-                                    }
-                                    Err(e) => {
-                                        if message.data.contains("ping") || message.event.contains("ping") {
-                                            debug!("Ignoring ping-related event: {}", message.data);
-                                            None
-                                        } else {
-                                            Some(Err(StreamingError::Parsing(
-                                                format!("Failed to parse SSE event: {} (raw: {})", e, message.data)
-                                            )))
+                            match response.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    for event in decoder.feed(&chunk) {
+                                        let is_done = event
+                                            .as_ref()
+                                            .is_ok_and(|event| event.data.trim() == "[DONE]");
+                                        pending.push_back(event);
+                                        if is_done {
+                                            done = true;
+                                            break;
                                         }
                                     }
                                 }
-                            } else {
-                                // Not valid JSON at all
-                                Some(Err(StreamingError::Parsing(
-                                    format!("SSE event is not valid JSON: {}", message.data)
-                                )))
-                            }
-                        }
-                        Err(e) => {
-                            // Check if this is a normal stream end vs actual error
-                            match e {
-                                reqwest_eventsource::Error::StreamEnded => {
-                                    debug!("SSE stream completed normally");
-                                    None // Normal stream end, not an error
+                                Err(error) => {
+                                    done = true;
+                                    pending.push_back(Err(error.into()));
                                 }
-                                reqwest_eventsource::Error::InvalidStatusCode(status, response) => {
-                                    // We have access to the response body for error details
-                                    let status_code = status.as_u16();
-
-                                    // Read the response body to get error details
-                                    let error_body = match response.text().await {
-                                        Ok(body) => body,
-                                        Err(_) => "Failed to read error response body".to_string()
-                                    };
-
-                                    error!("SSE connection error - HTTP {}: {}", status_code, error_body);
-
-                                    let detailed_error = format!(
-                                        "HTTP {} error: {}",
-                                        status_code,
-                                        error_body
-                                    );
-
-                                    Some(Err(StreamingError::Connection(detailed_error)))
-                                }
-                                _ => {
-                                    let error_str = e.to_string();
-                                    if error_str.contains("stream closed") {
-                                        debug!("SSE stream closed");
-                                        None
-                                    } else {
-                                        error!("SSE connection error: {}", e);
-                                        Some(Err(StreamingError::Connection(error_str)))
+                                Ok(None) => {
+                                    done = true;
+                                    for event in decoder.finish() {
+                                        pending.push_back(event);
                                     }
                                 }
                             }
                         }
                     }
-                });
+                );
 
-                Ok(stream)
+                Box::pin(stream)
+            }
+
+            async fn parse_sse_raw_stream_with_limit(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<String>, StreamingError>> + Send>>, StreamingError> {
+                Ok(match __open_sse_response(request_builder, max_response_body_bytes).await {
+                    Ok(response) => __raw_response_stream(response),
+                    Err(error) => Box::pin(futures_util::stream::once(async move { Err(error.error) })),
+                })
+            }
+
+            fn __json_event_stream<T>(
+                raw: Pin<Box<dyn Stream<Item = Result<SseEvent<String>, StreamingError>> + Send>>,
+            ) -> Pin<Box<dyn Stream<Item = Result<SseEvent<T>, StreamingError>> + Send>>
+            where
+                T: serde::de::DeserializeOwned + Send + 'static,
+            {
+                Box::pin(raw.filter_map(|event| async move {
+                    match event {
+                        Ok(event) => __deserialize_sse_event(event),
+                        Err(error) => Some(Err(error)),
+                    }
+                }))
+            }
+
+            async fn parse_sse_json_events_with_limit<T>(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<T>, StreamingError>> + Send>>, StreamingError>
+            where
+                T: serde::de::DeserializeOwned + Send + 'static,
+            {
+                Ok(__json_event_stream(
+                    parse_sse_raw_stream_with_limit(request_builder, max_response_body_bytes).await?,
+                ))
+            }
+
+            async fn parse_sse_json_stream_with_limit<T>(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<T, StreamingError>> + Send>>, StreamingError>
+            where
+                T: serde::de::DeserializeOwned + Send + 'static,
+            {
+                let events = parse_sse_json_events_with_limit(request_builder, max_response_body_bytes).await?;
+                Ok(Box::pin(events.map(|event| event.map(|event| event.data))))
+            }
+
+            struct __ReconnectState {
+                request: reqwest::RequestBuilder,
+                response: Option<reqwest::Response>,
+                decoder: __SseDecoder,
+                pending: std::collections::VecDeque<Result<SseEvent<String>, StreamingError>>,
+                options: SseReconnectOptions,
+                max_response_body_bytes: usize,
+                attempts: u32,
+                wait_before_open: bool,
+                done: bool,
+            }
+
+            async fn parse_sse_raw_reconnecting_with_limit(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+                options: SseReconnectOptions,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<String>, StreamingError>> + Send>>, StreamingError> {
+                if request_builder.try_clone().is_none() {
+                    return Err(StreamingError::Connection(
+                        "SSE reconnection requires a cloneable request body".to_string(),
+                    ));
+                }
+
+                let stream = futures_util::stream::unfold(
+                    __ReconnectState {
+                        request: request_builder,
+                        response: None,
+                        decoder: __SseDecoder::default(),
+                        pending: std::collections::VecDeque::new(),
+                        options,
+                        max_response_body_bytes,
+                        attempts: 0,
+                        wait_before_open: false,
+                        done: false,
+                    },
+                    |mut state| async move {
+                        loop {
+                            if let Some(item) = state.pending.pop_front() {
+                                return Some((item, state));
+                            }
+                            if state.done {
+                                return None;
+                            }
+
+                            if state.response.is_none() {
+                                if state.wait_before_open {
+                                    let delay = state.options.delay(
+                                        state.attempts.saturating_sub(1),
+                                        state.decoder.retry_delay,
+                                    );
+                                    debug!(?delay, attempt = state.attempts, "Reconnecting SSE stream");
+                                    futures_timer::Delay::new(delay).await;
+                                    state.wait_before_open = false;
+                                }
+
+                                let mut request = state.request.try_clone().expect("request clone checked");
+                                if let Some(last_event_id) = state.decoder.last_event_id.as_deref() {
+                                    request = request.header("Last-Event-ID", last_event_id);
+                                }
+                                match __open_sse_response(request, state.max_response_body_bytes).await {
+                                    Ok(response) => state.response = Some(response),
+                                    Err(error) if error.retryable && state.attempts < state.options.max_retries => {
+                                        state.attempts += 1;
+                                        state.wait_before_open = true;
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        state.done = true;
+                                        state.pending.push_back(Err(error.error));
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            let next = state.response.as_mut().expect("response opened").chunk().await;
+                            match next {
+                                Ok(Some(chunk)) => {
+                                    let events = state.decoder.feed(&chunk);
+                                    if !events.is_empty() {
+                                        state.attempts = 0;
+                                    }
+                                    for event in events {
+                                        let is_done = event
+                                            .as_ref()
+                                            .is_ok_and(|event| event.data.trim() == "[DONE]");
+                                        state.pending.push_back(event);
+                                        if is_done {
+                                            state.done = true;
+                                            state.response = None;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    let events = state.decoder.finish();
+                                    if !events.is_empty() {
+                                        state.attempts = 0;
+                                    }
+                                    for event in events {
+                                        let is_done = event
+                                            .as_ref()
+                                            .is_ok_and(|event| event.data.trim() == "[DONE]");
+                                        state.pending.push_back(event);
+                                        if is_done {
+                                            state.done = true;
+                                            break;
+                                        }
+                                    }
+                                    state.response = None;
+                                    state.decoder.reset_for_reconnect();
+                                    if !state.done {
+                                        if state.attempts < state.options.max_retries {
+                                            state.attempts += 1;
+                                            state.wait_before_open = true;
+                                        } else {
+                                            state.done = true;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    state.response = None;
+                                    state.decoder.reset_for_reconnect();
+                                    if state.attempts < state.options.max_retries {
+                                        state.attempts += 1;
+                                        state.wait_before_open = true;
+                                    } else {
+                                        state.done = true;
+                                        state.pending.push_back(Err(error.into()));
+                                    }
+                                }
+                            }
+                        }
+                    },
+                );
+                Ok(Box::pin(stream))
+            }
+
+            async fn parse_sse_json_reconnecting_events_with_limit<T>(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+                options: SseReconnectOptions,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent<T>, StreamingError>> + Send>>, StreamingError>
+            where
+                T: serde::de::DeserializeOwned + Send + 'static,
+            {
+                Ok(__json_event_stream(
+                    parse_sse_raw_reconnecting_with_limit(
+                        request_builder,
+                        max_response_body_bytes,
+                        options,
+                    ).await?,
+                ))
+            }
+
+            async fn parse_sse_json_reconnecting_with_limit<T>(
+                request_builder: reqwest::RequestBuilder,
+                max_response_body_bytes: usize,
+                options: SseReconnectOptions,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<T, StreamingError>> + Send>>, StreamingError>
+            where
+                T: serde::de::DeserializeOwned + Send + 'static,
+            {
+                let events = parse_sse_json_reconnecting_events_with_limit(
+                    request_builder,
+                    max_response_body_bytes,
+                    options,
+                ).await?;
+                Ok(Box::pin(events.map(|event| event.map(|event| event.data))))
             }
         })
     }

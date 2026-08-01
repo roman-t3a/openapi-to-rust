@@ -33,8 +33,8 @@
 //! # use openapi_to_rust::http_error::HttpError;
 //! fn handle_api_error(error: HttpError) {
 //!     match error {
-//!         HttpError::Network(msg) => {
-//!             eprintln!("Network error: {}", msg);
+//!         HttpError::Network(e) => {
+//!             eprintln!("Network error: {}", e);
 //!             // Will be retried automatically if retry is configured
 //!         }
 //!         HttpError::Http { status, message, .. } => {
@@ -117,16 +117,42 @@
 
 use thiserror::Error;
 
+/// The generated validation-problem profile based on RFC 9457.
+///
+/// The distinctive module name prevents collisions with OpenAPI schemas named
+/// `ProblemDetails` or `InvalidParameter`.
+pub mod openapi_to_rust_problem {
+    /// A sanitized validation problem emitted by generated servers.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+    pub struct ProblemDetails {
+        #[serde(rename = "type")]
+        pub type_uri: String,
+        pub title: String,
+        pub status: u16,
+        pub code: String,
+        #[serde(default)]
+        pub errors: Vec<InvalidParameter>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub instance: Option<String>,
+    }
+
+    /// One safe, machine-readable request validation violation.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+    pub struct InvalidParameter {
+        pub code: String,
+        pub location: String,
+        pub message: String,
+    }
+}
+
 /// HTTP client errors that can occur during API requests
 #[derive(Error, Debug)]
 pub enum HttpError {
-    /// Network or connection error.
-    ///
-    /// Stored as a string so this library crate does not depend on reqwest
-    /// (generated clients embed their own `HttpError` that wraps `reqwest::Error`
-    /// directly; this module is the shared helper surface for library users).
+    /// Network or connection error
     #[error("Network error: {0}")]
-    Network(String),
+    Network(#[from] reqwest::Error),
 
     /// Request serialization error
     #[error("Failed to serialize request: {0}")]
@@ -151,6 +177,10 @@ pub enum HttpError {
     /// Request timeout
     #[error("Request timeout")]
     Timeout,
+
+    /// A response body exceeded the configured in-memory limit
+    #[error("Response body exceeded configured limit of {limit} bytes")]
+    ResponseTooLarge { limit: usize },
 
     /// Invalid configuration
     #[error("Configuration error: {0}")]
@@ -203,11 +233,6 @@ impl HttpError {
             _ => false,
         }
     }
-
-    /// Create a network error from any displayable cause.
-    pub fn network_error(error: impl std::fmt::Display) -> Self {
-        Self::Network(error.to_string())
-    }
 }
 
 /// Result type for HTTP operations
@@ -217,21 +242,35 @@ pub type HttpResult<T> = Result<T, HttpError>;
 ///
 /// `ApiError<E>` is returned whenever the server actually responded — whether the
 /// status was non-2xx, or the 2xx body failed to deserialize into the expected
-/// type. `status`, `headers`, and `body` are always populated so callers can
-/// inspect what the server actually sent without having to hack the generated
-/// client. `typed` is `Some(_)` when the raw body was successfully parsed into a
+/// type. `status`, `headers`, and `raw_body` preserve what the server actually
+/// sent, while `body` is a convenient lossy UTF-8 rendering. `typed` is `Some(_)`
+/// when the response body was successfully parsed into a
 /// per-operation error type; `parse_error` records why parsing failed when not.
-///
-/// `headers` is a simple name→value map so the library crate does not depend on
-/// reqwest. Generated clients use `reqwest::header::HeaderMap` in their own
-/// emitted `ApiError` type.
+/// Formatting the error limits only the displayed body preview; the public
+/// fields retain the complete response and parsing details.
 #[derive(Debug, Clone)]
 pub struct ApiError<E> {
     pub status: u16,
-    pub headers: std::collections::BTreeMap<String, String>,
+    pub headers: reqwest::header::HeaderMap,
     pub body: String,
+    /// Exact response bytes before lossy UTF-8 conversion.
+    pub raw_body: Vec<u8>,
     pub typed: Option<E>,
     pub parse_error: Option<String>,
+}
+
+const API_ERROR_BODY_DISPLAY_LIMIT: usize = 500;
+const API_ERROR_BODY_TRUNCATION_MARKER: &str = "... [truncated]";
+
+fn display_api_error_body(body: &str) -> std::borrow::Cow<'_, str> {
+    let Some((end, _)) = body.char_indices().nth(API_ERROR_BODY_DISPLAY_LIMIT) else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+
+    let mut displayed = String::with_capacity(end + API_ERROR_BODY_TRUNCATION_MARKER.len());
+    displayed.push_str(&body[..end]);
+    displayed.push_str(API_ERROR_BODY_TRUNCATION_MARKER);
+    std::borrow::Cow::Owned(displayed)
 }
 
 impl<E> ApiError<E> {
@@ -242,11 +281,44 @@ impl<E> ApiError<E> {
     pub fn is_server_error(&self) -> bool {
         (500..600).contains(&self.status)
     }
+
+    /// Decode the generated RFC 9457 validation-problem profile without
+    /// disturbing a documented typed error.
+    ///
+    /// Only the `application/problem+json` media type is accepted. Arbitrary
+    /// JSON error bodies are deliberately not reclassified as Problem Details.
+    pub fn problem_details(&self) -> Option<openapi_to_rust_problem::ProblemDetails> {
+        let content_type = self
+            .headers
+            .get(reqwest::header::CONTENT_TYPE)?
+            .to_str()
+            .ok()?;
+        let media_type = content_type.split(';').next()?.trim();
+        if !media_type.eq_ignore_ascii_case("application/problem+json") {
+            return None;
+        }
+        serde_json::from_str(&self.body).ok()
+    }
 }
 
 impl<E: std::fmt::Debug> std::fmt::Display for ApiError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "API error {}: {}", self.status, self.body)
+        write!(
+            f,
+            "API error {}: {}",
+            self.status,
+            display_api_error_body(&self.body)
+        )?;
+
+        if let Some(typed) = &self.typed {
+            write!(f, "; typed: {typed:?}")?;
+        }
+
+        if let Some(parse_error) = &self.parse_error {
+            write!(f, "; parse error: {parse_error}")?;
+        }
+
+        Ok(())
     }
 }
 

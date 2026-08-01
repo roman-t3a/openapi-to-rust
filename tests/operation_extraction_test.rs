@@ -1,4 +1,5 @@
 use openapi_to_rust::analysis::{RequestBodyContent, SchemaAnalyzer};
+use openapi_to_rust::{CodeGenerator, GeneratorConfig};
 
 #[test]
 fn test_extract_simple_get() {
@@ -46,9 +47,69 @@ fn test_extract_post_with_body() {
         op.request_body.as_ref().and_then(|rb| rb.schema_name()),
         Some("CreateItemRequest")
     );
+    let body_schema = match op.request_body.as_ref().unwrap() {
+        RequestBodyContent::Json {
+            validation_schema, ..
+        } => validation_schema,
+        other => panic!("expected JSON body, got {other:?}"),
+    };
+    assert_eq!(
+        body_schema["$ref"],
+        "#/components/schemas/CreateItemRequest"
+    );
+    assert_eq!(analysis.validation_context.openapi_version, "3.1.0");
+    assert!(
+        analysis
+            .validation_context
+            .component_schemas
+            .contains_key("CreateItemRequest")
+    );
     assert!(!op.response_schemas.is_empty());
 
     insta::assert_yaml_snapshot!("post_with_body_operations", analysis.operations);
+}
+
+#[test]
+fn component_request_body_reference_is_resolved() {
+    let spec = std::fs::read_to_string(
+        "tests/fixtures/operation_extraction/component_request_body_ref.json",
+    )
+    .unwrap();
+    let spec_value: serde_json::Value = serde_json::from_str(&spec).unwrap();
+
+    let mut analyzer = SchemaAnalyzer::new(spec_value).unwrap();
+    let analysis = analyzer.analyze().unwrap();
+    let op = &analysis.operations["execute"];
+
+    assert!(op.request_body_required);
+    assert_eq!(
+        op.request_body.as_ref().and_then(|body| body.schema_name()),
+        Some("Program")
+    );
+    let body_schema = match op.request_body.as_ref().unwrap() {
+        RequestBodyContent::Json {
+            media_type,
+            validation_schema,
+            ..
+        } => {
+            assert_eq!(media_type, "application/json");
+            validation_schema
+        }
+        other => panic!("expected JSON body, got {other:?}"),
+    };
+    assert_eq!(body_schema["$ref"], "#/components/schemas/Program");
+
+    let generated = CodeGenerator::new(GeneratorConfig::default())
+        .generate_operation_methods(&analysis)
+        .to_string();
+    assert!(
+        generated.contains("request : Program"),
+        "generated client method must retain the referenced request body: {generated}"
+    );
+    assert!(
+        generated.contains("serde_json :: to_vec (& request)"),
+        "generated client must serialize the referenced request body: {generated}"
+    );
 }
 
 #[test]
@@ -72,6 +133,10 @@ fn test_extract_path_params() {
     assert_eq!(op.parameters[0].name, "itemId");
     assert_eq!(op.parameters[0].location, "path");
     assert!(op.parameters[0].required);
+    assert_eq!(
+        op.parameters[0].validation_schema.as_ref().unwrap()["type"],
+        "string"
+    );
 
     insta::assert_yaml_snapshot!("path_params_operations", analysis.operations);
 }
@@ -264,6 +329,69 @@ fn test_mixed_explicit_and_generated_operation_ids() {
 }
 
 #[test]
+fn large_operation_sets_keep_collision_ids_deterministic() {
+    let mut paths = serde_json::Map::new();
+    for index in 0..2_000 {
+        paths.insert(
+            format!("/bulk/{index}"),
+            serde_json::json!({
+                "get": {
+                    "operationId": format!("bulkOperation{index:04}"),
+                    "responses": {"204": {"description": "ok"}}
+                }
+            }),
+        );
+    }
+    paths.insert(
+        "/collision/1".into(),
+        serde_json::json!({
+            "get": {
+                "operationId": "Foo.bar",
+                "responses": {"204": {"description": "ok"}}
+            }
+        }),
+    );
+    paths.insert(
+        "/collision/2".into(),
+        serde_json::json!({
+            "get": {
+                "operationId": "foo_bar",
+                "responses": {"204": {"description": "ok"}}
+            }
+        }),
+    );
+    paths.insert(
+        "/collision/3".into(),
+        serde_json::json!({
+            "get": {
+                "operationId": "foo_bar",
+                "responses": {"204": {"description": "ok"}}
+            }
+        }),
+    );
+
+    let mut spec = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {"title": "large operation index", "version": "1.0.0"}
+    });
+    spec.as_object_mut()
+        .unwrap()
+        .insert("paths".into(), serde_json::Value::Object(paths));
+
+    let mut analyzer = SchemaAnalyzer::new(spec).unwrap();
+    let analysis = analyzer.analyze().unwrap();
+
+    assert_eq!(analysis.operations.len(), 2_003);
+    assert!(analysis.operations.contains_key("Foo.bar"));
+    assert!(analysis.operations.contains_key("foo_bar_get"));
+    assert!(analysis.operations.contains_key("foo_bar_get_2"));
+    assert_eq!(
+        analysis.operation_id_aliases.get("foo_bar").unwrap(),
+        &["foo_bar_get".to_string(), "foo_bar_get_2".to_string()]
+    );
+}
+
+#[test]
 fn test_extract_form_urlencoded_body() {
     let spec = std::fs::read_to_string("tests/fixtures/operation_extraction/form_urlencoded.json")
         .unwrap();
@@ -279,7 +407,7 @@ fn test_extract_form_urlencoded_body() {
     assert!(op.request_body.is_some());
     assert!(matches!(
         op.request_body.as_ref().unwrap(),
-        RequestBodyContent::FormUrlEncoded { schema_name } if schema_name == "TokenRequest"
+        RequestBodyContent::FormUrlEncoded { schema_name, .. } if schema_name == "TokenRequest"
     ));
 }
 
@@ -296,11 +424,22 @@ fn test_extract_multipart_body() {
         .operations
         .get("uploadFile")
         .expect("uploadFile operation not found");
-    assert!(op.request_body.is_some());
-    assert!(matches!(
-        op.request_body.as_ref().unwrap(),
-        RequestBodyContent::Multipart
-    ));
+    let request_body = op.request_body.as_ref().unwrap();
+    let RequestBodyContent::Multipart {
+        schema_name,
+        media_type,
+        validation_schema,
+    } = request_body
+    else {
+        panic!("expected typed multipart request body, got {request_body:?}");
+    };
+    assert_eq!(schema_name, "UploadFileRequest");
+    assert_eq!(media_type, "multipart/form-data");
+    assert_eq!(
+        validation_schema.pointer("/properties/file/format"),
+        Some(&serde_json::Value::String("binary".to_string()))
+    );
+    assert_eq!(request_body.schema_name(), Some("UploadFileRequest"));
 }
 
 #[test]
@@ -319,7 +458,7 @@ fn test_extract_octet_stream_body() {
     assert!(op.request_body.is_some());
     assert!(matches!(
         op.request_body.as_ref().unwrap(),
-        RequestBodyContent::OctetStream
+        RequestBodyContent::OctetStream { .. }
     ));
 }
 
@@ -339,7 +478,7 @@ fn test_extract_text_plain_body() {
     assert!(op.request_body.is_some());
     assert!(matches!(
         op.request_body.as_ref().unwrap(),
-        RequestBodyContent::TextPlain
+        RequestBodyContent::TextPlain { .. }
     ));
 }
 
@@ -361,6 +500,47 @@ fn test_content_type_priority() {
     assert!(op.request_body.is_some());
     assert!(matches!(
         op.request_body.as_ref().unwrap(),
-        RequestBodyContent::Json { schema_name } if schema_name == "CreateItemRequest"
+        RequestBodyContent::Json { schema_name, .. } if schema_name == "CreateItemRequest"
+    ));
+}
+
+#[test]
+fn request_body_media_type_and_schema_less_content_are_retained() {
+    let vendor_spec = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": { "title": "vendor json", "version": "1" },
+        "paths": { "/items": { "post": {
+            "operationId": "createItem",
+            "requestBody": { "required": true, "content": {
+                "application/vnd.example+json": {
+                    "schema": { "type": "object", "additionalProperties": false }
+                }
+            }},
+            "responses": { "204": { "description": "ok" } }
+        }}}
+    });
+    let analysis = SchemaAnalyzer::new(vendor_spec).unwrap().analyze().unwrap();
+    assert!(matches!(
+        &analysis.operations["createItem"].request_body,
+        Some(RequestBodyContent::Json { media_type, .. })
+            if media_type == "application/vnd.example+json"
+    ));
+
+    let schema_less = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": { "title": "schema-less", "version": "1" },
+        "paths": { "/items": { "post": {
+            "operationId": "createItem",
+            "requestBody": { "required": true, "content": {
+                "application/json": {}
+            }},
+            "responses": { "204": { "description": "ok" } }
+        }}}
+    });
+    let analysis = SchemaAnalyzer::new(schema_less).unwrap().analyze().unwrap();
+    assert!(matches!(
+        &analysis.operations["createItem"].request_body,
+        Some(RequestBodyContent::SchemaLess { media_type })
+            if media_type == "application/json"
     ));
 }

@@ -2,6 +2,7 @@
 **/target/
 # Build outputs from spec-compile.sh and ad-hoc generator runs.
 /tmp/spec-compile/
+/tmp/spec-compile-target/
 /tmp/gen-anthropic/
 /tmp/gen-openai/
 /tmp/gen-cloudflare/
@@ -10,6 +11,8 @@
 *.swo
 *~
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Lazy-cloned external corpus (see tests/conformance/external/apis-guru-sync.sh)
 /tests/conformance/external/apis-guru/
@@ -23,3 +26,14 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Astro documentation site dependencies and output.
+/website/node_modules/
+/website/dist/
+/website/.astro/
+/website/.vercel/
+
+# Playground WASM bundle: built by scripts/build-playground-wasm.sh locally,
+# published as a GitHub release asset by .github/workflows/playground-wasm.yml
+# and fetched by website/scripts/fetch-playground-wasm.mjs on Vercel.
+/website/public/playground/pkg/

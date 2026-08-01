@@ -292,6 +292,7 @@ fn demonstrate_rust_api(
         http_client_config: Some(HttpClientConfig {
             base_url: Some("https://api.example.com".to_string()),
             timeout_seconds: Some(30),
+            max_response_body_bytes: Some(8 * 1024 * 1024),
             default_headers: {
                 let mut headers = std::collections::HashMap::new();
                 headers.insert("content-type".to_string(), "application/json".to_string());
@@ -315,7 +316,9 @@ fn demonstrate_rust_api(
         enable_registry: false,
         registry_only: false,
         types: openapi_to_rust::TypeMappingConfig::default(),
+        builders: openapi_to_rust::config::BuildersSection::default(),
         server: None,
+        client: None,
     };
 
     // Generate code

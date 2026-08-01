@@ -1,0 +1,401 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const title = "OpenAPI Generator for Rust | Reqwest Clients & Axum Servers";
+const description = "Generate Serde models, async Reqwest clients, typed errors, SSE streams, and Axum server traits from OpenAPI 3.0 and 3.1 with openapi-to-rust.";
+
+const generatedEnum = `#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum ToolResultCaller {
+    #[serde(rename = "direct")]
+    DirectCaller(DirectCaller),
+    #[serde(rename = "server")]
+    ServerCaller(ServerCaller),
+}`;
+
+const corpusCommand = `# Every pull request
+SPEC_COMPILE_PARSE_ONLY=1 scripts/spec-compile.sh
+scripts/spec-compile.sh anthropic openai
+
+# Scheduled and manual CI
+scripts/spec-compile.sh`;
+
+const ciCommand = `openapi-to-rust generate openapi.yaml --check --quiet
+cargo check`;
+
+const schemas = [
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    name: "openapi-to-rust",
+    alternateName: "OpenAPI to Rust",
+    url: "https://openapi-to-rust.dev/",
+    description,
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    name: "openapi-to-rust",
+    description,
+    codeRepository: "https://github.com/gpu-cli/openapi-to-rust",
+    downloadUrl: "https://crates.io/crates/openapi-to-rust",
+    programmingLanguage: "Rust",
+    runtimePlatform: "Rust 1.88 or newer",
+    softwareVersion: "0.8.0",
+    license: "https://opensource.org/license/mit",
+    keywords: "OpenAPI generator Rust, Rust API client generator, Axum server generator, Reqwest codegen",
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: [
+      {
+        "@type": "Question",
+        name: "What does this OpenAPI generator for Rust emit?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text: "openapi-to-rust emits shared Serde models, selected async Reqwest methods, typed API errors, optional SSE streams, and selected Axum server traits and routes.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "Which OpenAPI versions are supported?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text: "OpenAPI 3.0 and 3.1 are supported. OpenAPI 3.2 parsing is experimental. Swagger 2.0 documents are not accepted.",
+        },
+      },
+      {
+        "@type": "Question",
+        name: "Does generated code validate every schema constraint at runtime?",
+        acceptedAnswer: {
+          "@type": "Answer",
+          text: "No. Minimums, maximums, and patterns are emitted as Rust documentation rather than runtime validators.",
+        },
+      },
+    ],
+  },
+];
+---
+
+<BaseLayout {title} {description} canonicalPath="/" schema={schemas}>
+  <section class="hero">
+    <div class="shell hero-grid">
+      <div class="hero-copy">
+        <p class="hero-kicker">OpenAPI generator for Rust</p>
+        <h1>Generate Rust clients and Axum servers from OpenAPI.</h1>
+        <p class="hero-lead">
+          <code>openapi-to-rust</code> turns OpenAPI 3.0 and 3.1 documents into shared Serde
+          models, selected Reqwest methods, typed API errors, SSE streams, and Axum traits.
+        </p>
+        <p class="hero-ci">CI generates all 54 specs on every pull request; OpenAI and Anthropic outputs also compile.</p>
+        <div class="button-row">
+          <a class="button button-primary" href="/playground">Try it in your browser <span aria-hidden="true">→</span></a>
+          <a class="button button-secondary" href="/docs/getting-started">Install the CLI <span aria-hidden="true">→</span></a>
+        </div>
+        <p class="hero-meta">v0.8.0 · Rust 1.88+ · MIT licensed</p>
+      </div>
+
+      <a
+        class="hero-trial"
+        id="quick-start"
+        href="/playground"
+        aria-label="Open the playground: paste an OpenAPI document and get Rust in about five seconds, without installing anything"
+      >
+        <figure class="code-block spec-to-rust" aria-hidden="true">
+          <figcaption>
+            <span>openapi.yaml → src/generated/types.rs</span>
+            <span class="code-language">wasm</span>
+          </figcaption>
+          <pre><code><span class="c-n">Message</span>:
+  <span class="c-k">type</span>: object
+  <span class="c-k">required</span>: [id, role]
+  <span class="c-k">properties</span>:
+    <span class="c-t">id</span>:   {"{"} <span class="c-k">type</span>: string {"}"}
+    <span class="c-t">role</span>: {"{"} <span class="c-k">$ref</span>: "#/components/schemas/Role" {"}"}</code></pre>
+          <div class="teaser-step">↓ the real generator, in your browser — about 5 seconds</div>
+          <pre><code><span class="c-k">pub struct</span> <span class="c-n">Message</span> {"{"}
+    <span class="c-k">pub</span> <span class="c-t">id</span>: String,
+    <span class="c-k">pub</span> <span class="c-t">role</span>: Role,
+{"}"}</code></pre>
+        </figure>
+        <span class="output-tree hero-teaser-cta">
+          <span>Paste your own spec — nothing is uploaded.</span>
+          <b>Open the playground <span aria-hidden="true">→</span></b>
+        </span>
+      </a>
+    </div>
+  </section>
+
+  <section class="ci-proof section-pad" aria-labelledby="ci-proof-heading">
+    <div class="shell evidence-grid">
+      <div class="evidence-copy">
+        <h2 id="ci-proof-heading">What CI verifies.</h2>
+        <p>
+          Every pull request runs the generator over 54 supported documents. OpenAI and Anthropic
+          generated crates also run <code>cargo check</code> with exact dependencies. The scheduled
+          and manual tier is configured to compile all 54. One Swagger 2.0 document is skipped.
+        </p>
+        <p class="evidence-boundary">
+          This establishes parse, generation, and compile coverage—not behavior against a live API.
+        </p>
+        <nav class="inline-links" aria-label="CI evidence links">
+          <a href="https://github.com/gpu-cli/openapi-to-rust/blob/main/.github/workflows/ci.yml">Read the workflow <span aria-hidden="true">↗</span></a>
+          <a href="https://github.com/gpu-cli/openapi-to-rust/tree/main/specs">Browse all specs <span aria-hidden="true">↗</span></a>
+          <a href="/compatibility">Compatibility details <span aria-hidden="true">→</span></a>
+        </nav>
+      </div>
+      <div class="ci-artifact">
+        <CodeBlock label="Corpus checks" code={corpusCommand} />
+        <div class="ci-tiers" role="group" aria-label="Continuous integration coverage by tier">
+          <p><strong>Every pull request</strong><span>54 generate · OpenAI + Anthropic <code>cargo check</code></span><em>active</em></p>
+          <p><strong>Scheduled / manual</strong><span>All 54 run <code>cargo check</code></span><em>configured</em></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="generated section-pad" id="generated-output" aria-labelledby="generated-heading">
+    <div class="shell generated-grid">
+      <div class="generated-copy">
+        <h2 id="generated-heading">Inspect the generated Rust.</h2>
+        <p>
+          This enum comes from the checked-in discriminator fixture. The repository also includes a
+          generated Reqwest client and a compiled Axum implementation for OpenAI’s Responses API.
+        </p>
+        <div class="artifact-index">
+          <a href="https://github.com/gpu-cli/openapi-to-rust/blob/main/src/snapshots/openapi_to_rust__test_helpers__default_discriminated_union_field.snap">
+            <span>Model fixture</span><strong>Tagged Serde enum</strong><i aria-hidden="true">↗</i>
+          </a>
+          <a href="https://github.com/gpu-cli/openapi-to-rust/blob/main/examples/generated/client.rs">
+            <span>Client output</span><strong>Reqwest methods and typed errors</strong><i aria-hidden="true">↗</i>
+          </a>
+          <a href="https://github.com/gpu-cli/openapi-to-rust/tree/main/examples/server-openai-responses">
+            <span>Server example</span><strong>Axum traits, routes, and SSE</strong><i aria-hidden="true">↗</i>
+          </a>
+        </div>
+      </div>
+      <CodeBlock label="Generated types.rs" language="rust" code={generatedEnum} />
+    </div>
+  </section>
+
+  <section class="selection section-pad" aria-labelledby="selection-heading">
+    <div class="shell selection-grid">
+      <div>
+        <h2 id="selection-heading">Generate only the operations you use.</h2>
+        <p class="section-intro">
+          Select an exact <code>operationId</code>, <code>METHOD /path</code>, or <code>tag:name</code>.
+          Optional pruning keeps schemas reachable from the selected client and server operations.
+        </p>
+      </div>
+      <dl class="output-list">
+        <div><dt>Shared models</dt><dd>One <code>types.rs</code> for request and response shapes on both sides.</dd></div>
+        <div><dt>Reqwest client</dt><dd>Async methods, auth, typed responses and errors, retries, tracing, and SSE.</dd></div>
+        <div><dt>Axum server</dt><dd>Per-tag traits, response enums, parameter extraction, routing, and SSE responses.</dd></div>
+      </dl>
+    </div>
+    <div class="shell inline-links selection-links">
+      <a href="/docs/rust-client-generator">Configure client generation <span aria-hidden="true">→</span></a>
+      <a href="/openapi-to-axum">Configure Axum generation <span aria-hidden="true">→</span></a>
+    </div>
+  </section>
+
+  <section class="adoption section-pad" aria-labelledby="adoption-heading">
+    <div class="shell adoption-grid">
+      <div>
+        <h2 id="adoption-heading">Commit generated code. Fail CI when it drifts.</h2>
+        <p class="section-intro">
+          <code>--check</code> exits nonzero when committed output no longer matches the OpenAPI document
+          or configuration. Use <code>--dry-run</code> to inspect the generation plan without writing files.
+        </p>
+        <a class="text-link" href="/docs/getting-started">Read the complete workflow <span aria-hidden="true">→</span></a>
+      </div>
+      <CodeBlock label="Project CI" code={ciCommand} />
+    </div>
+  </section>
+
+  <section class="decision section-pad" aria-labelledby="decision-heading">
+    <div class="shell decision-grid">
+      <div>
+        <h2 id="decision-heading">Before you adopt it.</h2>
+        <p class="section-intro">
+          openapi-to-rust is intentionally Rust-only and optimized for complex third-party specifications.
+          Compare it with Progenitor’s Dropshot-aligned client workflow or OpenAPI Generator’s multi-language ecosystem.
+        </p>
+        <a class="text-link" href="/compare">Compare features and tradeoffs <span aria-hidden="true">→</span></a>
+      </div>
+      <div class="faq-list">
+        <details open>
+          <summary>What does this OpenAPI generator for Rust emit?</summary>
+          <p>Shared Serde models, selected async Reqwest methods, typed API errors, optional SSE streams, and selected Axum traits and routes.</p>
+        </details>
+        <details>
+          <summary>Which OpenAPI versions are supported?</summary>
+          <p>OpenAPI 3.0 and 3.1 are supported. OpenAPI 3.2 parsing is experimental. Swagger 2.0 documents are not accepted.</p>
+        </details>
+        <details>
+          <summary>Does generated code validate every schema constraint at runtime?</summary>
+          <p>No. Minimums, maximums, and patterns are emitted as Rust documentation rather than runtime validators.</p>
+        </details>
+      </div>
+    </div>
+    <div class="shell closing">
+      <div>
+        <h3>Start with your spec.</h3>
+        <p class="install-line"><code>cargo install --locked openapi-to-rust</code></p>
+      </div>
+      <div class="button-row">
+        <a class="button button-primary" href="/docs/getting-started">Generate Rust code <span aria-hidden="true">→</span></a>
+        <a class="button button-secondary" href="https://github.com/gpu-cli/openapi-to-rust">View the source <span aria-hidden="true">↗</span></a>
+        <a class="text-link" href="https://crates.io/crates/openapi-to-rust">Open on crates.io <span aria-hidden="true">↗</span></a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .section-pad { padding-block: clamp(var(--space-3xl), 7vw, var(--space-4xl)); }
+
+  .hero {
+    border-bottom: 1px solid var(--ink);
+    background: var(--paper);
+    padding: clamp(var(--space-3xl), 7vw, var(--space-4xl)) 0 var(--space-2xl);
+  }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
+    align-items: center;
+    gap: clamp(var(--space-2xl), 6vw, var(--space-4xl));
+  }
+
+  .hero-kicker {
+    margin-bottom: var(--space-md);
+    color: var(--rust-dark);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+  }
+
+  .hero-copy h1 { max-width: 760px; font-size: clamp(2.8rem, 5.7vw, 5rem); }
+  .hero-lead { max-width: 680px; margin-top: var(--space-lg); color: var(--ink-soft); font-size: clamp(1.05rem, 1.8vw, 1.28rem); line-height: 1.6; }
+  .hero-ci { max-width: 650px; margin-top: var(--space-md); color: var(--muted); font-size: 0.88rem; }
+  .hero-copy .button-row { margin-top: var(--space-lg); }
+  .hero-meta { margin-top: var(--space-md); color: var(--muted); font-family: var(--font-mono); font-size: 0.78rem; }
+  .hero-trial { display: block; min-width: 0; text-decoration: none; color: inherit; }
+  .hero-trial .code-block { box-shadow: 8px 8px 0 var(--ink); transition: transform 150ms ease, box-shadow 150ms ease; }
+  .hero-trial:hover .code-block { transform: translate(-2px, -2px); box-shadow: 10px 10px 0 var(--ink); }
+  .hero-trial:hover .hero-teaser-cta b { color: var(--rust-dark); }
+
+  .spec-to-rust pre { overflow-x: auto; margin: 0; padding: 1rem 1.3rem; font-size: 0.8rem; line-height: 1.65; }
+  .spec-to-rust .c-k { color: #e8a87c; }
+  .spec-to-rust .c-t { color: #9ecfb5; }
+  .spec-to-rust .c-n { color: var(--lime); }
+  .teaser-step {
+    border-block: 1px solid var(--line-dark);
+    background: #080b11;
+    color: var(--code-muted);
+    padding: 0.5rem 1.3rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+  }
+
+  .hero-teaser-cta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+  }
+  .hero-teaser-cta > span { color: var(--muted); font-size: 0.82rem; }
+  .hero-teaser-cta b { font-size: 0.9rem; font-weight: 800; white-space: nowrap; }
+
+  .output-tree { border: 1px solid var(--ink); border-top: 0; background: var(--white); padding: var(--space-md) var(--space-lg); }
+
+  .ci-proof { background: var(--ink); color: var(--white); }
+  .evidence-grid, .generated-grid, .selection-grid, .adoption-grid, .decision-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(360px, 0.9fr);
+    align-items: center;
+    gap: clamp(var(--space-2xl), 7vw, var(--space-4xl));
+  }
+  .evidence-copy h2, .generated-copy h2, .selection h2, .adoption h2, .decision h2 { font-size: clamp(2.2rem, 4.5vw, 3.8rem); }
+  .evidence-copy > p, .generated-copy > p { max-width: 660px; margin-top: var(--space-md); }
+  .evidence-copy > p { color: var(--code-text); }
+  .evidence-copy .evidence-boundary { color: var(--code-muted); font-size: 0.9rem; }
+  .ci-proof code:not(pre code) { border-color: #596273; background: #1b2230; color: var(--code-text); }
+  .ci-artifact { min-width: 0; }
+  .ci-proof :global(.code-block) { border-color: #4b5361; box-shadow: none; }
+  .ci-tiers { border-bottom: 1px solid #4b5361; background: #080b11; font-family: var(--font-mono); font-size: 0.875rem; }
+  .ci-tiers p { display: grid; grid-template-columns: 0.75fr 1.35fr auto; align-items: center; gap: var(--space-sm); padding: var(--space-sm) var(--space-md); }
+  .ci-tiers p + p { border-top: 1px solid #303846; }
+  .ci-tiers strong { color: var(--white); }
+  .ci-tiers span { color: var(--code-muted); }
+  .ci-tiers em { color: var(--lime); font-style: normal; }
+  .ci-tiers code { color: inherit; font-size: 1em; white-space: nowrap; }
+
+  .inline-links { display: flex; flex-wrap: wrap; gap: var(--space-sm) var(--space-lg); margin-top: var(--space-lg); }
+  .inline-links a, .text-link { display: inline-flex; min-height: 44px; align-items: center; font-weight: 800; }
+  .ci-proof .inline-links a { color: var(--lime); }
+
+  .generated { background: var(--white); }
+  .generated-copy > p { color: var(--muted); }
+  .generated :global(.code-block) { box-shadow: none; }
+  .artifact-index { margin-top: var(--space-xl); border-top: 1px solid var(--ink); }
+  .artifact-index a { display: grid; grid-template-columns: 0.7fr 1.2fr auto; align-items: center; gap: var(--space-md); border-bottom: 1px solid var(--line); padding-block: var(--space-md); text-decoration: none; }
+  .artifact-index a:hover strong { color: var(--rust-dark); }
+  .artifact-index span { color: var(--muted); font-family: var(--font-mono); font-size: 0.72rem; }
+  .artifact-index strong { font-size: 0.88rem; }
+  .artifact-index i { color: var(--rust-dark); font-style: normal; }
+
+  .selection { border-block: 1px solid var(--ink); background: var(--paper-deep); }
+  .selection-grid { align-items: start; }
+  .output-list { margin: 0; border-top: 2px solid var(--ink); }
+  .output-list > div { display: grid; grid-template-columns: 0.65fr 1.35fr; gap: var(--space-lg); border-bottom: 1px solid var(--line); padding-block: var(--space-md); }
+  .output-list dt { font-weight: 850; }
+  .output-list dd { margin: 0; color: var(--muted); }
+  .selection-links { margin-top: var(--space-2xl); }
+
+  .adoption { background: var(--white); }
+  .adoption-grid :global(.code-block) { box-shadow: none; }
+  .adoption .text-link, .decision .text-link { display: inline-flex; gap: var(--space-xs); margin-top: var(--space-lg); color: var(--rust-dark); }
+
+  .decision { border-top: 1px solid var(--ink); }
+  .decision-grid { align-items: start; }
+  .faq-list { border-top: 1px solid var(--ink); }
+  .faq-list details { border-bottom: 1px solid var(--line); padding-block: var(--space-md); }
+  .faq-list summary { display: flex; min-height: 44px; align-items: center; justify-content: space-between; gap: var(--space-md); cursor: pointer; font-weight: 800; list-style: none; }
+  .faq-list summary::-webkit-details-marker { display: none; }
+  .faq-list summary::after { color: var(--rust-dark); content: "+"; font-family: var(--font-mono); font-size: 1.2rem; }
+  .faq-list details[open] summary::after { content: "−"; }
+  .faq-list p { max-width: 680px; padding: var(--space-xs) var(--space-xl) 0 0; color: var(--muted); }
+
+  .closing { display: flex; align-items: center; justify-content: space-between; gap: var(--space-xl); margin-top: var(--space-3xl); border-top: 1px solid var(--ink); padding-top: var(--space-xl); }
+  .closing h3 { font-size: clamp(1.7rem, 3vw, 2.5rem); }
+  .install-line { margin-top: var(--space-sm); }
+  .install-line code { font-size: 0.82rem; }
+  .closing .button-row { align-items: center; }
+
+  @media (max-width: 900px) {
+    .hero-grid, .evidence-grid, .generated-grid, .selection-grid, .adoption-grid, .decision-grid { grid-template-columns: 1fr; }
+    .hero-trial { max-width: 680px; }
+    .artifact-index { max-width: 680px; }
+  }
+
+  @media (max-width: 620px) {
+    .hero { padding-top: var(--space-2xl); }
+    .hero-copy h1 { font-size: clamp(2.55rem, 12vw, 3.75rem); }
+    .hero-lead { margin-top: var(--space-md); }
+    .hero-copy .button-row { margin-top: var(--space-lg); }
+    .ci-tiers p { grid-template-columns: 1fr auto; }
+    .ci-tiers p > span { grid-column: 1 / -1; }
+    .artifact-index a { grid-template-columns: 1fr auto; }
+    .artifact-index a span { grid-column: 1 / -1; }
+    .output-list > div { grid-template-columns: 1fr; gap: var(--space-xs); }
+    .closing { align-items: flex-start; flex-direction: column; }
+    .closing .button-row { width: 100%; }
+    .closing .text-link { margin: var(--space-xs) 0 0; }
+  }
+</style>

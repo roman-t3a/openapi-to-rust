@@ -1,4 +1,129 @@
-use openapi_to_rust::http_error::{HttpError, HttpResult};
+use openapi_to_rust::http_error::{ApiError, HttpError, HttpResult};
+use reqwest::header::HeaderMap;
+
+#[derive(Debug)]
+enum TypedApiError {
+    Invalid,
+}
+
+fn api_error<E>(
+    body: impl Into<String>,
+    typed: Option<E>,
+    parse_error: Option<&str>,
+) -> ApiError<E> {
+    let body = body.into();
+    ApiError {
+        status: 422,
+        headers: HeaderMap::new(),
+        raw_body: body.as_bytes().to_vec(),
+        body,
+        typed,
+        parse_error: parse_error.map(str::to_owned),
+    }
+}
+
+fn problem_body() -> String {
+    serde_json::json!({
+        "type": "https://openapi-to-rust.dev/problems/validation",
+        "title": "Request validation failed",
+        "status": 422,
+        "code": "request_validation_failed",
+        "errors": [{
+            "code": "required",
+            "location": "/body/name",
+            "message": "is required"
+        }]
+    })
+    .to_string()
+}
+
+#[test]
+fn api_error_decodes_only_problem_json_media_type() {
+    for content_type in [
+        "application/problem+json",
+        "Application/Problem+Json; charset=utf-8",
+    ] {
+        let mut error = api_error::<TypedApiError>(problem_body(), None, None);
+        error
+            .headers
+            .insert(reqwest::header::CONTENT_TYPE, content_type.parse().unwrap());
+        let problem = error.problem_details().expect("typed problem details");
+        assert_eq!(problem.status, 422);
+        assert_eq!(problem.code, "request_validation_failed");
+        assert_eq!(problem.errors[0].location, "/body/name");
+    }
+
+    let mut ordinary_json = api_error::<TypedApiError>(problem_body(), None, None);
+    ordinary_json.headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    assert!(ordinary_json.problem_details().is_none());
+
+    let mut malformed = api_error::<TypedApiError>("not json", None, None);
+    malformed.headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        "application/problem+json".parse().unwrap(),
+    );
+    assert!(malformed.problem_details().is_none());
+}
+
+#[test]
+fn test_api_error_display_normal_body() {
+    let error = api_error::<TypedApiError>("small response", None, None);
+
+    assert_eq!(error.to_string(), "API error 422: small response");
+}
+
+#[test]
+fn api_error_preserves_raw_non_utf8_body() {
+    let raw_body = vec![0, 159, 146, 150, 255];
+    let error = ApiError::<TypedApiError> {
+        status: 500,
+        headers: HeaderMap::new(),
+        body: String::from_utf8_lossy(&raw_body).into_owned(),
+        raw_body: raw_body.clone(),
+        typed: None,
+        parse_error: None,
+    };
+
+    assert_eq!(error.raw_body, raw_body);
+    assert!(error.body.contains('\u{fffd}'));
+}
+
+#[test]
+fn test_api_error_display_truncates_body_without_mutating_it() {
+    let body = "é".repeat(600);
+    let error = api_error::<TypedApiError>(body.clone(), None, None);
+    let displayed = error.to_string();
+
+    assert_eq!(
+        displayed,
+        format!("API error 422: {}... [truncated]", "é".repeat(500))
+    );
+    assert_eq!(error.body, body);
+}
+
+#[test]
+fn test_api_error_display_includes_typed_error() {
+    let error = api_error("validation failed", Some(TypedApiError::Invalid), None);
+
+    assert_eq!(
+        error.to_string(),
+        "API error 422: validation failed; typed: Invalid"
+    );
+}
+
+#[test]
+fn test_api_error_display_includes_parse_error() {
+    let error =
+        api_error::<TypedApiError>("not json", None, Some("expected value at line 1 column 1"));
+
+    assert_eq!(
+        error.to_string(),
+        "API error 422: not json; parse error: expected value at line 1 column 1"
+    );
+}
 
 #[test]
 fn test_http_error_creation() {
@@ -17,6 +142,12 @@ fn test_http_error_creation() {
     // Test timeout error
     let timeout_error = HttpError::Timeout;
     assert!(matches!(timeout_error, HttpError::Timeout));
+
+    let response_too_large = HttpError::ResponseTooLarge { limit: 1024 };
+    assert!(matches!(
+        response_too_large,
+        HttpError::ResponseTooLarge { limit: 1024 }
+    ));
 
     // Test config error
     let config_error = HttpError::Config("invalid config".to_string());
@@ -140,6 +271,9 @@ fn test_retryable_errors() {
 
     let config_error = HttpError::Config("invalid".to_string());
     assert!(!config_error.is_retryable());
+
+    let response_too_large = HttpError::ResponseTooLarge { limit: 1024 };
+    assert!(!response_too_large.is_retryable());
 }
 
 #[test]
@@ -229,8 +363,11 @@ fn test_generated_error_code() {
             type_mappings: BTreeMap::new(),
         },
         operations: BTreeMap::new(),
+        operation_responses: BTreeMap::new(),
+        operation_id_aliases: BTreeMap::new(),
         used_type_features: Default::default(),
         enum_extensions: BTreeMap::new(),
+        validation_context: Default::default(),
     };
 
     // Generate HTTP client code which includes error types
@@ -286,6 +423,10 @@ fn test_generated_error_code() {
         "Generated code should contain ApiError struct"
     );
     assert!(
+        client_content.contains("pub raw_body: Vec<u8>"),
+        "Generated ApiError should preserve exact response bytes"
+    );
+    assert!(
         client_content.contains("pub enum ApiOpError"),
         "Generated code should contain ApiOpError enum"
     );
@@ -310,6 +451,30 @@ fn test_generated_error_code() {
     assert!(
         client_content.contains("pub fn is_retryable"),
         "Generated code should contain is_retryable method"
+    );
+    assert!(
+        client_content.contains("API_ERROR_BODY_DISPLAY_LIMIT"),
+        "Generated code should bound the displayed API error body"
+    );
+    assert!(
+        client_content.contains("pub mod openapi_to_rust_problem"),
+        "Generated clients should namespace RFC 9457 types"
+    );
+    assert!(
+        client_content.contains("pub fn problem_details"),
+        "Generated API errors should decode application/problem+json"
+    );
+    assert!(
+        client_content.contains("API_ERROR_BODY_TRUNCATION_MARKER"),
+        "Generated code should include a clear body truncation marker"
+    );
+    assert!(
+        client_content.contains("typed: {typed:?}"),
+        "Generated code should display typed API error details"
+    );
+    assert!(
+        client_content.contains("parse error: {parse_error}"),
+        "Generated code should display typed parsing failures"
     );
 
     // Verify HttpResult type alias

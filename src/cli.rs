@@ -1,7 +1,15 @@
+use crate::spec_source::{is_remote_spec, parse_oas_version, parse_spec, validate_remote_spec_url};
 use crate::{CodeGenerator, GeneratorConfig, SchemaAnalyzer, streaming::StreamingConfig};
 use clap::{Arg, Command};
 use std::fs;
+use std::io::Read;
 use std::process;
+use std::time::Duration;
+
+/// Maximum accepted size for a remotely fetched OpenAPI document (64 MiB).
+pub const MAX_REMOTE_SPEC_BYTES: u64 = 64 * 1024 * 1024;
+/// End-to-end timeout for fetching a remote OpenAPI document.
+pub const REMOTE_SPEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for the CLI helper
 pub struct CliConfig {
@@ -15,7 +23,8 @@ pub struct CliConfig {
     pub enable_specta: bool,
 }
 
-/// Run the complete generation CLI with the provided configuration
+/// Run the legacy embedded generation CLI with the provided configuration.
+#[deprecated(note = "use the openapi-to-rust binary's generate command")]
 pub async fn run_generation_cli(cli_config: CliConfig) {
     let matches = Command::new("api-gen")
         .version("0.1.0")
@@ -85,7 +94,7 @@ pub async fn run_generation_cli(cli_config: CliConfig) {
     }
 
     // Load OpenAPI spec
-    let spec_content = match load_spec(input, verbose).await {
+    let spec_content = match load_spec(input) {
         Ok(content) => content,
         Err(e) => {
             eprintln!("❌ Error loading spec: {e}");
@@ -247,207 +256,65 @@ pub async fn run_generation_cli(cli_config: CliConfig) {
     }
 }
 
-async fn load_spec(input: &str, verbose: bool) -> Result<String, Box<dyn std::error::Error>> {
-    if input.starts_with("http://") || input.starts_with("https://") {
-        #[cfg(feature = "fetch")]
-        {
-            // Load from URL (requires the optional `fetch` feature / reqwest).
-            if verbose {
-                println!("🌐 Fetching from URL...");
-            }
-
-            let response = reqwest::get(input).await?;
-            if !response.status().is_success() {
-                return Err(format!("HTTP error: {}", response.status()).into());
-            }
-
-            let content = response.text().await?;
-            Ok(content)
+/// Load a local or remote OpenAPI document with bounded remote I/O.
+///
+/// HTTPS is accepted everywhere. Plain HTTP is accepted only for loopback
+/// hosts so local development and deterministic integration tests do not need
+/// a certificate while non-local traffic remains encrypted.
+pub fn load_spec(input: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if !is_remote_spec(input) {
+        if input.contains("://") {
+            return match validate_remote_spec_url(input) {
+                Ok(_) => Err("unsupported remote OpenAPI URL".into()),
+                Err(error) => Err(error.into()),
+            };
         }
-        #[cfg(not(feature = "fetch"))]
-        {
-            let _ = verbose;
-            Err(
-                "Remote OpenAPI URL loading requires the `fetch` cargo feature \
-                 (enable with `--features fetch`). Default builds stay free of \
-                 reqwest / native-tls for library consumers."
-                    .into(),
-            )
-        }
-    } else {
-        // Load from file
-        if verbose {
-            println!("📁 Reading from file...");
-        }
-
-        let content = fs::read_to_string(input)?;
-        Ok(content)
-    }
-}
-
-/// Parse the `openapi` version string into (major, minor). Tolerates patch and
-/// build-metadata suffixes. Returns None for unrecognised input.
-pub fn parse_oas_version(s: &str) -> Option<(u32, u32)> {
-    let mut parts = s.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor_raw = parts.next()?;
-    let minor_digits: String = minor_raw
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let minor = minor_digits.parse().ok()?;
-    Some((major, minor))
-}
-
-fn parse_spec(content: &str, input: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    // Determine format from extension or content
-    let is_yaml = input.ends_with(".yaml")
-        || input.ends_with(".yml")
-        || content.trim_start().starts_with("openapi:")
-        || content.trim_start().starts_with("swagger:");
-
-    if is_yaml {
-        let value = yaml_to_json_value(content)?;
-        Ok(value)
-    } else {
-        let value = json_from_str_lossy(content)?;
-        Ok(value)
-    }
-}
-
-/// Parse YAML to serde_json::Value, converting large numbers to f64 to avoid overflow.
-/// serde_yaml_ng (like archived serde_yaml 0.9) cannot represent integers exceeding
-/// i64/u64 range (e.g. numbers > 2^64), so we preprocess the YAML to convert such
-/// numbers to float notation, then go through serde_yaml_ng::Value and convert to
-/// serde_json::Value manually.
-pub fn yaml_to_json_value(content: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let preprocessed = sanitize_large_yaml_integers(content);
-    let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&preprocessed)?;
-    Ok(yaml_value_to_json(yaml_value))
-}
-
-/// Parse JSON with lossy number handling: numbers that overflow i64/u64 are stored as f64.
-pub fn json_from_str_lossy(content: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    // Try normal parsing first (fast path)
-    match serde_json::from_str::<serde_json::Value>(content) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            let err_msg = e.to_string();
-            if err_msg.contains("number out of range") {
-                // Fall back: parse via YAML which handles large numbers
-                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(content)?;
-                Ok(yaml_value_to_json(yaml_value))
-            } else {
-                Err(e.into())
-            }
-        }
-    }
-}
-
-fn yaml_value_to_json(yaml: serde_yaml_ng::Value) -> serde_json::Value {
-    match yaml {
-        serde_yaml_ng::Value::Null => serde_json::Value::Null,
-        serde_yaml_ng::Value::Bool(b) => serde_json::Value::Bool(b),
-        serde_yaml_ng::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::Value::Number(i.into())
-            } else if let Some(u) = n.as_u64() {
-                serde_json::Value::Number(u.into())
-            } else if let Some(f) = n.as_f64() {
-                serde_json::json!(f)
-            } else {
-                // Fallback: represent as 0.0
-                serde_json::json!(0.0)
-            }
-        }
-        serde_yaml_ng::Value::String(s) => serde_json::Value::String(s),
-        serde_yaml_ng::Value::Sequence(seq) => {
-            serde_json::Value::Array(seq.into_iter().map(yaml_value_to_json).collect())
-        }
-        serde_yaml_ng::Value::Mapping(map) => {
-            let obj = map
-                .into_iter()
-                .filter_map(|(k, v)| {
-                    let key = match k {
-                        serde_yaml_ng::Value::String(s) => s,
-                        serde_yaml_ng::Value::Number(n) => n.to_string(),
-                        serde_yaml_ng::Value::Bool(b) => b.to_string(),
-                        _ => return None,
-                    };
-                    Some((key, yaml_value_to_json(v)))
-                })
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        serde_yaml_ng::Value::Tagged(tagged) => yaml_value_to_json(tagged.value),
-    }
-}
-
-/// Preprocess YAML content to convert integers that exceed i64/u64 range to float notation.
-/// serde_yaml_ng cannot parse integers larger than u64::MAX or smaller than i64::MIN,
-/// so we find bare integer values on YAML lines and append `.0` if they overflow.
-fn sanitize_large_yaml_integers(content: &str) -> String {
-    let mut result = String::with_capacity(content.len());
-    for line in content.lines() {
-        if let Some(sanitized) = try_sanitize_integer_line(line) {
-            result.push_str(&sanitized);
-        } else {
-            result.push_str(line);
-        }
-        result.push('\n');
-    }
-    result
-}
-
-/// If a YAML line has a `key: <integer>` pattern where the integer overflows i64/u64,
-/// convert it to float by appending `.0`. Returns None if no change needed.
-fn try_sanitize_integer_line(line: &str) -> Option<String> {
-    // Match pattern: optional whitespace, key, colon, space(s), then a number value
-    // We look for the value portion after the last `: ` or `- ` on the line
-    let trimmed = line.trim();
-
-    // Skip comments and empty lines
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return None;
+        return Ok(fs::read_to_string(input)?);
     }
 
-    // Find the value part — after `: ` for mapping entries
-    let colon_pos = line.find(": ")?;
-    let value_start = colon_pos + 2;
-    let value_str = line[value_start..].trim();
-
-    // Check if the value looks like a bare integer (optional leading minus, then digits)
-    if value_str.is_empty() {
-        return None;
+    let url = validate_remote_spec_url(input)?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(REMOTE_SPEC_TIMEOUT)
+        // Redirects are intentionally disabled: an allowed HTTPS URL could
+        // otherwise redirect to disallowed plaintext transport.
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("openapi-to-rust/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let response = client.get(url).send().map_err(|error| {
+        format!(
+            "failed to fetch remote OpenAPI document: {}",
+            error.without_url()
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to fetch OpenAPI document: HTTP {}",
+            response.status()
+        )
+        .into());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_SPEC_BYTES)
+    {
+        return Err(format!(
+            "remote OpenAPI document exceeds the {} MiB response-size limit",
+            MAX_REMOTE_SPEC_BYTES / 1024 / 1024
+        )
+        .into());
     }
 
-    let (is_negative, digit_part) = if let Some(rest) = value_str.strip_prefix('-') {
-        (true, rest)
-    } else {
-        (false, value_str)
-    };
-
-    // Must be all digits
-    if !digit_part.chars().all(|c| c.is_ascii_digit()) || digit_part.is_empty() {
-        return None;
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_REMOTE_SPEC_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REMOTE_SPEC_BYTES {
+        return Err(format!(
+            "remote OpenAPI document exceeds the {} MiB response-size limit",
+            MAX_REMOTE_SPEC_BYTES / 1024 / 1024
+        )
+        .into());
     }
-
-    // Check if it overflows i64/u64
-    let overflows = if is_negative {
-        // Check if |value| > i64::MAX + 1 = 9223372036854775808
-        digit_part.len() > 19 || (digit_part.len() == 19 && digit_part > "9223372036854775808")
-    } else {
-        // Check if value > u64::MAX = 18446744073709551615
-        digit_part.len() > 20 || (digit_part.len() == 20 && digit_part > "18446744073709551615")
-    };
-
-    if overflows {
-        // Replace the integer with float notation
-        let mut sanitized = line[..value_start].to_string();
-        sanitized.push_str(value_str);
-        sanitized.push_str(".0");
-        Some(sanitized)
-    } else {
-        None
-    }
+    Ok(String::from_utf8(bytes)?)
 }

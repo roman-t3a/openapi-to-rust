@@ -147,12 +147,68 @@
 //! 5. Handles query parameters and request bodies
 //! 6. Configures middleware stack based on generator config
 
-use crate::analysis::{OperationInfo, ParameterInfo, SchemaAnalysis};
+use crate::analysis::{OperationInfo, OperationResponseBody, ParameterInfo, SchemaAnalysis};
 use crate::generator::CodeGenerator;
-use heck::ToSnakeCase;
+use heck::{ToPascalCase, ToSnakeCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::BTreeMap;
+
+struct AllocatedOperationParam<'a> {
+    param: &'a ParameterInfo,
+    ident: syn::Ident,
+}
+
+#[derive(Clone)]
+struct BodyFieldPlan {
+    wire_name: String,
+    preferred_method_name: String,
+    value_ident: syn::Ident,
+    value_type: TokenStream,
+    access_path: Vec<syn::Ident>,
+}
+
+#[derive(Clone, Copy)]
+enum MultipartClientFieldKind {
+    RawBytes,
+    Base64,
+    Base64UrlUnpadded,
+    Text,
+}
+
+#[derive(Clone, Copy)]
+enum ClientSuccessBody<'a> {
+    Json(&'a str),
+    Text,
+    Binary,
+    EventStream,
+    Empty,
+}
+
+#[derive(Clone)]
+struct ClientSuccessSelection<'a> {
+    statuses: Vec<&'a str>,
+    body: ClientSuccessBody<'a>,
+    accept: Option<&'a str>,
+}
+
+enum RequiredBodyConstruction {
+    Default,
+    New(Vec<BodyConstructorParam>),
+    Whole,
+}
+
+struct BodyConstructorParam {
+    preferred_ident: syn::Ident,
+    value_type: TokenStream,
+}
+
+struct BodyModelPlan {
+    body_ident: syn::Ident,
+    body_type: TokenStream,
+    required_construction: RequiredBodyConstruction,
+    optional_fields: Vec<BodyFieldPlan>,
+}
 
 impl CodeGenerator {
     /// Generate the HTTP client struct with middleware support
@@ -190,6 +246,9 @@ impl CodeGenerator {
             use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
             use std::collections::BTreeMap;
 
+            /// Default upper bound for any response body buffered in memory.
+            pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
             /// HTTP client for making API requests
             #[derive(Clone)]
             pub struct HttpClient {
@@ -197,6 +256,22 @@ impl CodeGenerator {
                 api_key: Option<String>,
                 http_client: ClientWithMiddleware,
                 custom_headers: BTreeMap<String, String>,
+                max_response_body_bytes: usize,
+            }
+
+            async fn __read_bounded_response_body(
+                mut response: reqwest::Response,
+                limit: usize,
+            ) -> Result<Vec<u8>, HttpError> {
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(HttpError::Network)? {
+                    let next_len = body.len().checked_add(chunk.len());
+                    if next_len.is_none_or(|next_len| next_len > limit) {
+                        return Err(HttpError::ResponseTooLarge { limit });
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(body)
             }
         };
 
@@ -253,6 +328,26 @@ impl CodeGenerator {
 
     /// Generate the constructor method
     fn generate_constructor(&self, has_retry: bool, has_tracing: bool) -> TokenStream {
+        // Seed `base_url` from configuration rather than always starting empty.
+        // A client built with an empty base URL sends every request to a
+        // relative path and fails, so a user who set `[http_client] base_url`
+        // in their TOML — or whose spec declares `servers[0].url`, which the
+        // config layer resolves into the same field — previously had to repeat
+        // it via `with_base_url` or watch every call 404 (openapi-generator-igg).
+        let configured_base_url = self
+            .config()
+            .http_client_config
+            .as_ref()
+            .and_then(|http| http.base_url.as_deref())
+            .unwrap_or_default();
+        let default_base_url = quote! { #configured_base_url.to_string() };
+        let max_response_body_bytes = self
+            .config()
+            .http_client_config
+            .as_ref()
+            .and_then(|http| http.max_response_body_bytes)
+            .unwrap_or(8 * 1024 * 1024);
+
         let retry_param = if has_retry {
             quote! { retry_config: Option<RetryConfig>, }
         } else {
@@ -326,10 +421,11 @@ impl CodeGenerator {
                     let http_client = client_builder.build();
 
                     Self {
-                        base_url: String::new(),
+                        base_url: #default_base_url,
                         api_key: None,
                         http_client,
                         custom_headers: BTreeMap::new(),
+                        max_response_body_bytes: #max_response_body_bytes,
                     }
                 }
             }
@@ -350,10 +446,11 @@ impl CodeGenerator {
                     let http_client = client_builder.build();
 
                     Self {
-                        base_url: String::new(),
+                        base_url: #default_base_url,
                         api_key: None,
                         http_client,
                         custom_headers: BTreeMap::new(),
+                        max_response_body_bytes: #max_response_body_bytes,
                     }
                 }
             }
@@ -377,6 +474,12 @@ impl CodeGenerator {
                 self
             }
 
+            /// Set the maximum number of response-body bytes buffered in memory.
+            pub fn with_max_response_body_bytes(mut self, limit: usize) -> Self {
+                self.max_response_body_bytes = limit;
+                self
+            }
+
             /// Add a custom header to all requests
             pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
                 self.custom_headers.insert(name.into(), value.into());
@@ -395,40 +498,642 @@ impl CodeGenerator {
     ///
     /// Emits per-operation typed error enums (one variant per declared non-2xx
     /// response with a body schema) BEFORE the `impl HttpClient` block so the
-    /// generated method signatures can reference them.
+    /// generated method signatures can reference them. This low-level helper
+    /// intentionally emits every analyzed operation; use
+    /// [`Self::generate_http_client`] or [`Self::generate_all`] to honor the
+    /// configured `[client].operations` scope.
     pub fn generate_operation_methods(&self, analysis: &SchemaAnalysis) -> TokenStream {
-        let param_enums = self.generate_param_enum_types(analysis);
+        let operations: Vec<&OperationInfo> = analysis.operations.values().collect();
+        self.generate_operation_methods_for(analysis, &operations)
+    }
 
-        let op_error_enums: Vec<TokenStream> = analysis
-            .operations
-            .values()
+    /// Generate every operation-owned client artifact from one resolved
+    /// operation slice. This keeps methods, parameter enums, and typed error
+    /// enums in lockstep for selective clients.
+    pub(crate) fn generate_operation_methods_for(
+        &self,
+        analysis: &SchemaAnalysis,
+        operations: &[&OperationInfo],
+    ) -> TokenStream {
+        let param_enums = self.generate_param_enum_types(operations);
+
+        let op_error_enums: Vec<TokenStream> = operations
+            .iter()
+            .copied()
             .filter_map(|op| self.generate_op_error_enum(op))
             .collect();
 
-        let methods: Vec<TokenStream> = analysis
-            .operations
-            .values()
-            .map(|op| self.generate_single_operation_method(op))
+        let methods: Vec<TokenStream> = operations
+            .iter()
+            .copied()
+            .map(|op| self.generate_single_operation_method(analysis, op))
             .collect();
+
+        let (operation_builders, builder_entries) =
+            self.generate_operation_builders(analysis, operations);
 
         quote! {
             #param_enums
 
             #(#op_error_enums)*
 
+            #(#operation_builders)*
+
             impl HttpClient {
                 #(#methods)*
+                #(#builder_entries)*
             }
         }
+    }
+
+    fn generate_operation_builders(
+        &self,
+        analysis: &SchemaAnalysis,
+        operations: &[&OperationInfo],
+    ) -> (Vec<TokenStream>, Vec<TokenStream>) {
+        if !self.config().builders.enabled {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut used_entry_methods: std::collections::HashSet<String> = operations
+            .iter()
+            .map(|operation| self.get_method_name(operation).to_string())
+            .collect();
+        let mut used_type_names = std::collections::HashSet::new();
+        for schema_name in analysis.schemas.keys() {
+            let rust_name = self.to_rust_type_name(schema_name);
+            used_type_names.insert(rust_name.clone());
+            // Request-model builders live in `types.rs` and are imported by
+            // glob into the client module. Reserve their conventional names
+            // so operation builders cannot create ambiguous re-exports.
+            used_type_names.insert(format!("{rust_name}Builder"));
+        }
+        used_type_names.insert("HttpClient".to_string());
+        used_type_names.insert("ApiOpError".to_string());
+        used_type_names.extend(
+            [
+                "ClientBuilder",
+                "ClientWithMiddleware",
+                "RetryConfig",
+                "HttpError",
+                "BTreeMap",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        for operation in operations {
+            used_type_names.insert(self.op_error_enum_ident(operation).to_string());
+            used_type_names.extend(
+                operation
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.enum_values.is_some())
+                    .map(|parameter| parameter.rust_type.clone()),
+            );
+        }
+
+        let mut definitions = Vec::new();
+        let mut entries = Vec::new();
+        for operation in operations {
+            let allocated_params = self.allocated_operation_params(operation);
+            let body_plan = self.body_model_plan(operation, analysis);
+            let optional_param_count = allocated_params
+                .iter()
+                .filter(|allocated| !Self::builder_param_is_required(allocated.param))
+                .count();
+            let optional_body_count =
+                usize::from(operation.request_body.is_some() && !operation.request_body_required);
+            let body_field_count = body_plan
+                .as_ref()
+                .filter(|plan| {
+                    operation.request_body_required
+                        || matches!(
+                            &plan.required_construction,
+                            RequiredBodyConstruction::Default
+                        )
+                })
+                .map_or(0, |plan| plan.optional_fields.len());
+            let optional_count = optional_param_count + optional_body_count + body_field_count;
+            if optional_count <= self.config().builders.threshold {
+                continue;
+            }
+
+            let flat_method = self.get_method_name(operation);
+            let entry_base = format!("{flat_method}_builder");
+            let entry_name = Self::allocate_name(&entry_base, &mut used_entry_methods);
+            let entry_ident = Self::to_field_ident(&entry_name);
+
+            let builder_base = format!("{}Builder", flat_method.to_string().to_pascal_case());
+            let builder_name = Self::allocate_type_name(&builder_base, &mut used_type_names);
+            let builder_ident = format_ident!("{builder_name}");
+
+            let (definition, entry) = self.generate_single_operation_builder(
+                analysis,
+                operation,
+                &allocated_params,
+                body_plan,
+                &flat_method,
+                &entry_ident,
+                &builder_ident,
+            );
+            definitions.push(definition);
+            entries.push(entry);
+        }
+
+        (definitions, entries)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_single_operation_builder(
+        &self,
+        analysis: &SchemaAnalysis,
+        operation: &OperationInfo,
+        allocated_params: &[AllocatedOperationParam<'_>],
+        body_plan: Option<BodyModelPlan>,
+        flat_method: &syn::Ident,
+        entry_ident: &syn::Ident,
+        builder_ident: &syn::Ident,
+    ) -> (TokenStream, TokenStream) {
+        let mut fields = vec![quote! { client: &'a HttpClient }];
+        let mut entry_parameters = Vec::new();
+        let mut initializers = vec![quote! { client: self }];
+        let mut call_arguments = Vec::new();
+        let mut setters = Vec::new();
+        let mut used_entry_params = std::collections::HashSet::new();
+        let mut used_methods = std::collections::HashSet::from(["send".to_string()]);
+
+        for allocated in allocated_params {
+            let field_ident = &allocated.ident;
+            let storage_type = self.builder_param_storage_type(allocated.param);
+            if Self::builder_param_is_required(allocated.param) {
+                fields.push(quote! { #field_ident: #storage_type });
+                let entry_name =
+                    Self::allocate_name(&field_ident.to_string(), &mut used_entry_params);
+                let entry_param = Self::to_field_ident(&entry_name);
+                if Self::param_has_impl_as_ref_type(allocated.param) {
+                    entry_parameters.push(quote! { #entry_param: impl Into<String> });
+                    initializers.push(quote! { #field_ident: #entry_param.into() });
+                } else {
+                    entry_parameters.push(quote! { #entry_param: #storage_type });
+                    initializers.push(quote! { #field_ident: #entry_param });
+                }
+            } else {
+                fields.push(quote! { #field_ident: Option<#storage_type> });
+                initializers.push(quote! { #field_ident: None });
+                let setter_ident =
+                    Self::allocate_builder_method(&field_ident.to_string(), &mut used_methods);
+                let wire_name = &allocated.param.name;
+                let assignment = if Self::param_has_impl_as_ref_type(allocated.param) {
+                    quote! { self.#field_ident = Some(#field_ident.into()); }
+                } else {
+                    quote! { self.#field_ident = Some(#field_ident); }
+                };
+                let setter_type = if Self::param_has_impl_as_ref_type(allocated.param) {
+                    quote! { impl Into<String> }
+                } else {
+                    storage_type.clone()
+                };
+                setters.push(quote! {
+                    #[doc = concat!("Set the optional `", #wire_name, "` operation parameter.")]
+                    #[must_use]
+                    pub fn #setter_ident(mut self, #field_ident: #setter_type) -> Self {
+                        #assignment
+                        self
+                    }
+                });
+            }
+            call_arguments.push(quote! { self.#field_ident });
+        }
+
+        if let Some(body_plan) = body_plan {
+            let BodyModelPlan {
+                body_ident,
+                body_type,
+                required_construction,
+                optional_fields,
+            } = body_plan;
+            let can_initialize_optional_body =
+                matches!(&required_construction, RequiredBodyConstruction::Default);
+            if operation.request_body_required {
+                fields.push(quote! { #body_ident: #body_type });
+                match required_construction {
+                    RequiredBodyConstruction::Default => {
+                        initializers.push(quote! { #body_ident: Default::default() });
+                    }
+                    RequiredBodyConstruction::New(constructor_params) => {
+                        let mut constructor_args = Vec::new();
+                        for constructor in constructor_params {
+                            let preferred = constructor.preferred_ident.to_string();
+                            let entry_name =
+                                Self::allocate_name(&preferred, &mut used_entry_params);
+                            let entry_param = Self::to_field_ident(&entry_name);
+                            let value_type = constructor.value_type;
+                            entry_parameters.push(quote! { #entry_param: #value_type });
+                            constructor_args.push(entry_param);
+                        }
+                        initializers.push(quote! {
+                            #body_ident: #body_type::new(#(#constructor_args),*)
+                        });
+                    }
+                    RequiredBodyConstruction::Whole => {
+                        let entry_name =
+                            Self::allocate_name(&body_ident.to_string(), &mut used_entry_params);
+                        let entry_param = Self::to_field_ident(&entry_name);
+                        entry_parameters.push(quote! { #entry_param: #body_type });
+                        initializers.push(quote! { #body_ident: #entry_param });
+                    }
+                }
+            } else {
+                fields.push(quote! { #body_ident: Option<#body_type> });
+                initializers.push(quote! { #body_ident: None });
+            }
+
+            let body_setter =
+                Self::allocate_builder_method(&body_ident.to_string(), &mut used_methods);
+            let body_assignment = if operation.request_body_required {
+                quote! { self.#body_ident = #body_ident; }
+            } else {
+                quote! { self.#body_ident = Some(#body_ident); }
+            };
+            setters.push(quote! {
+                /// Replace the complete request body.
+                #[must_use]
+                pub fn #body_setter(mut self, #body_ident: #body_type) -> Self {
+                    #body_assignment
+                    self
+                }
+            });
+
+            if operation.request_body_required || can_initialize_optional_body {
+                for field in optional_fields {
+                    let setter_ident = Self::allocate_builder_method(
+                        &field.preferred_method_name,
+                        &mut used_methods,
+                    );
+                    let value_ident = field.value_ident;
+                    let value_type = field.value_type;
+                    let wire_name = field.wire_name;
+                    let access_path = field.access_path;
+                    let assignment = if operation.request_body_required {
+                        let mut target = quote! { self.#body_ident };
+                        for access in &access_path {
+                            target = quote! { #target.#access };
+                        }
+                        quote! { #target = Some(#value_ident); }
+                    } else {
+                        let mut target = quote! { request };
+                        for access in &access_path {
+                            target = quote! { #target.#access };
+                        }
+                        quote! {
+                            let request = self.#body_ident.get_or_insert_with(Default::default);
+                            #target = Some(#value_ident);
+                        }
+                    };
+                    setters.push(quote! {
+                        #[doc = concat!("Set the optional request-body field `", #wire_name, "`.")]
+                        #[must_use]
+                        pub fn #setter_ident(mut self, #value_ident: #value_type) -> Self {
+                            #assignment
+                            self
+                        }
+                    });
+                }
+            }
+            call_arguments.push(quote! { self.#body_ident });
+        }
+
+        let response_type = self.get_response_type(analysis, operation);
+        let error_type = self.op_error_type_token(operation);
+        let operation_id = &operation.operation_id;
+        let definition = quote! {
+            #[doc = concat!("Additive request builder for `", #operation_id, "`.")]
+            #[must_use]
+            pub struct #builder_ident<'a> {
+                #(#fields,)*
+            }
+
+            impl<'a> #builder_ident<'a> {
+                #(#setters)*
+
+                /// Send the request through the existing flat operation method.
+                pub async fn send(self) -> Result<#response_type, ApiOpError<#error_type>> {
+                    self.client.#flat_method(#(#call_arguments),*).await
+                }
+            }
+        };
+        let entry = quote! {
+            #[doc = concat!("Start an additive builder for `", #operation_id, "`.")]
+            pub fn #entry_ident(
+                &self,
+                #(#entry_parameters),*
+            ) -> #builder_ident<'_> {
+                #builder_ident {
+                    #(#initializers,)*
+                }
+            }
+        };
+        (definition, entry)
+    }
+
+    fn allocate_name(base: &str, used: &mut std::collections::HashSet<String>) -> String {
+        let mut candidate = base.to_string();
+        let mut suffix = 2;
+        while !used.insert(candidate.clone()) {
+            candidate = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        candidate
+    }
+
+    fn allocate_type_name(base: &str, used: &mut std::collections::HashSet<String>) -> String {
+        if used.insert(base.to_string()) {
+            return base.to_string();
+        }
+
+        let mut suffix = 2;
+        loop {
+            let candidate = format!("{base}{suffix}");
+            if used.insert(candidate.clone()) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn allocate_builder_method(
+        preferred: &str,
+        used: &mut std::collections::HashSet<String>,
+    ) -> syn::Ident {
+        let plain = preferred.strip_prefix("r#").unwrap_or(preferred);
+        let base = if used.contains(preferred) {
+            format!("with_{plain}")
+        } else {
+            preferred.to_string()
+        };
+        let allocated = Self::allocate_name(&base, used);
+        Self::to_field_ident(&allocated)
+    }
+
+    fn allocated_operation_params<'a>(
+        &self,
+        operation: &'a OperationInfo,
+    ) -> Vec<AllocatedOperationParam<'a>> {
+        // Builder-internal storage uses these names. Operation parameters are
+        // positional when delegated to the flat method, so suffixing only the
+        // builder field is safe and prevents duplicate struct fields.
+        let mut used = std::collections::HashSet::from([
+            "client".to_string(),
+            "request".to_string(),
+            "form".to_string(),
+            "body".to_string(),
+        ]);
+        let mut allocated = Vec::new();
+        for location in ["path", "query", "header", "cookie"] {
+            for parameter in &operation.parameters {
+                if parameter.location != location {
+                    continue;
+                }
+                let raw = self.param_ident_str(parameter);
+                let chosen = Self::allocate_name(&raw, &mut used);
+                allocated.push(AllocatedOperationParam {
+                    param: parameter,
+                    ident: Self::to_field_ident(&chosen),
+                });
+            }
+        }
+        allocated
+    }
+
+    fn builder_param_is_required(parameter: &ParameterInfo) -> bool {
+        // The existing flat signature always emits path parameters as bare
+        // values. Invalid real-world specs sometimes omit `required: true`;
+        // mirror the flat contract so builder delegation remains type-correct.
+        parameter.location == "path" || parameter.required
+    }
+
+    fn builder_param_storage_type(&self, parameter: &ParameterInfo) -> TokenStream {
+        self.get_param_owned_rust_type(parameter)
+    }
+
+    fn param_has_impl_as_ref_type(parameter: &ParameterInfo) -> bool {
+        !matches!(
+            &parameter.query_serialization,
+            Some(
+                crate::analysis::QuerySerialization::FormExplodedArray { .. }
+                    | crate::analysis::QuerySerialization::FormArray { .. }
+                    | crate::analysis::QuerySerialization::SimpleHeaderArray { .. },
+            )
+        ) && Self::param_uses_as_ref_str(parameter)
+    }
+
+    fn body_model_plan(
+        &self,
+        operation: &OperationInfo,
+        analysis: &SchemaAnalysis,
+    ) -> Option<BodyModelPlan> {
+        use crate::analysis::{ObjectAdditionalProperties, RequestBodyContent, SchemaType};
+
+        let request_body = operation.request_body.as_ref()?;
+        let (body_name, body_ident) = match request_body {
+            RequestBodyContent::Json { schema_name, .. }
+            | RequestBodyContent::FormUrlEncoded { schema_name, .. }
+            | RequestBodyContent::Multipart { schema_name, .. } => {
+                (schema_name.as_str(), format_ident!("request"))
+            }
+            RequestBodyContent::OctetStream { .. }
+            | RequestBodyContent::Binary { .. }
+            | RequestBodyContent::Unsupported { .. } => {
+                return Some(BodyModelPlan {
+                    body_ident: format_ident!("body"),
+                    body_type: quote! { Vec<u8> },
+                    required_construction: RequiredBodyConstruction::Whole,
+                    optional_fields: Vec::new(),
+                });
+            }
+            RequestBodyContent::TextPlain { .. } => {
+                return Some(BodyModelPlan {
+                    body_ident: format_ident!("body"),
+                    body_type: quote! { String },
+                    required_construction: RequiredBodyConstruction::Whole,
+                    optional_fields: Vec::new(),
+                });
+            }
+            RequestBodyContent::SchemaLess { .. } => return None,
+        };
+        let body_type_name = self.to_rust_type_name(body_name);
+        let body_type = syn::Ident::new(&body_type_name, proc_macro2::Span::call_site());
+        let Some((resolved_name, resolved_schema)) =
+            self.resolve_reference_schema(body_name, analysis)
+        else {
+            return Some(BodyModelPlan {
+                body_ident,
+                body_type: quote! { #body_type },
+                required_construction: RequiredBodyConstruction::Whole,
+                optional_fields: Vec::new(),
+            });
+        };
+
+        let mut optional_fields = Vec::new();
+        let mut stack = std::collections::HashSet::new();
+        self.collect_optional_body_fields(
+            resolved_name,
+            Vec::new(),
+            analysis,
+            &mut stack,
+            &mut optional_fields,
+        );
+
+        let required_construction = match &resolved_schema.schema_type {
+            SchemaType::Object {
+                properties,
+                required,
+                additional_properties,
+            } if !self.is_discriminated_variant(resolved_name, analysis) => {
+                let emitted = self.emitted_object_properties(
+                    resolved_name,
+                    properties,
+                    required,
+                    additional_properties,
+                    analysis,
+                    None,
+                );
+                let required_fields: Vec<_> = emitted
+                    .iter()
+                    .filter(|field| field.is_required)
+                    .map(|field| BodyConstructorParam {
+                        preferred_ident: field.ident.clone(),
+                        value_type: field.field_type.clone(),
+                    })
+                    .collect();
+                if required_fields.is_empty() {
+                    RequiredBodyConstruction::Default
+                } else if emitted.iter().any(|field| !field.is_required)
+                    || !matches!(additional_properties, ObjectAdditionalProperties::Forbidden)
+                {
+                    RequiredBodyConstruction::New(required_fields)
+                } else {
+                    RequiredBodyConstruction::Whole
+                }
+            }
+            _ => RequiredBodyConstruction::Whole,
+        };
+
+        Some(BodyModelPlan {
+            body_ident,
+            body_type: quote! { #body_type },
+            required_construction,
+            optional_fields,
+        })
+    }
+
+    fn resolve_reference_schema<'a>(
+        &self,
+        schema_name: &'a str,
+        analysis: &'a SchemaAnalysis,
+    ) -> Option<(&'a str, &'a crate::analysis::AnalyzedSchema)> {
+        let mut current = schema_name;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+            let schema = analysis.schemas.get(current)?;
+            if let crate::analysis::SchemaType::Reference { target } = &schema.schema_type {
+                current = target;
+            } else {
+                return Some((current, schema));
+            }
+        }
+    }
+
+    fn collect_optional_body_fields(
+        &self,
+        schema_name: &str,
+        access_path: Vec<syn::Ident>,
+        analysis: &SchemaAnalysis,
+        stack: &mut std::collections::HashSet<String>,
+        output: &mut Vec<BodyFieldPlan>,
+    ) {
+        use crate::analysis::SchemaType;
+        if !stack.insert(schema_name.to_string()) {
+            return;
+        }
+        let Some(schema) = analysis.schemas.get(schema_name) else {
+            stack.remove(schema_name);
+            return;
+        };
+        match &schema.schema_type {
+            SchemaType::Reference { target } => {
+                self.collect_optional_body_fields(target, access_path, analysis, stack, output);
+            }
+            SchemaType::Object {
+                properties,
+                required,
+                additional_properties,
+            } if !self.is_discriminated_variant(schema_name, analysis) => {
+                for field in self.emitted_object_properties(
+                    schema_name,
+                    properties,
+                    required,
+                    additional_properties,
+                    analysis,
+                    None,
+                ) {
+                    if field.is_required {
+                        continue;
+                    }
+                    let mut field_path = access_path.clone();
+                    field_path.push(field.ident.clone());
+                    output.push(BodyFieldPlan {
+                        wire_name: field.wire_name.to_string(),
+                        preferred_method_name: field.ident.to_string(),
+                        value_ident: field.ident.clone(),
+                        value_type: self.generate_property_base_type(
+                            schema_name,
+                            field.wire_name,
+                            field.property,
+                            analysis,
+                        ),
+                        access_path: field_path,
+                    });
+                }
+            }
+            SchemaType::Composition { schemas } => {
+                for (index, schema_ref) in schemas.iter().enumerate() {
+                    let mut nested_path = access_path.clone();
+                    nested_path.push(format_ident!("part_{index}"));
+                    self.collect_optional_body_fields(
+                        &schema_ref.target,
+                        nested_path,
+                        analysis,
+                        stack,
+                        output,
+                    );
+                }
+            }
+            _ => {}
+        }
+        stack.remove(schema_name);
+    }
+
+    fn is_discriminated_variant(&self, schema_name: &str, analysis: &SchemaAnalysis) -> bool {
+        analysis.schemas.values().any(|schema| {
+            matches!(
+                &schema.schema_type,
+                crate::analysis::SchemaType::DiscriminatedUnion { variants, .. }
+                    if variants.iter().any(|variant| variant.type_name == schema_name)
+            )
+        })
     }
 
     /// Emit inline enum types for parameters whose schema is `type: string`
     /// with `enum` or `const`. The generated enum implements `Display` so it
     /// drops into the existing `format!`-based path/query templating without
     /// any special-casing at the call site. See issue #10 follow-up.
-    fn generate_param_enum_types(&self, analysis: &SchemaAnalysis) -> TokenStream {
+    fn generate_param_enum_types(&self, operations: &[&OperationInfo]) -> TokenStream {
         let mut by_name: BTreeMap<String, &ParameterInfo> = BTreeMap::new();
-        for op in analysis.operations.values() {
+        for op in operations {
             for param in &op.parameters {
                 if param.enum_values.is_some() {
                     by_name.entry(param.rust_type.clone()).or_insert(param);
@@ -461,10 +1166,23 @@ impl CodeGenerator {
         // while keeping each `serde(rename)` pointing at the original
         // wire string.
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // `x-enum-varnames` wins over the naming heuristic when the spec
+        // supplies it — the whole point of the extension is that the author
+        // knows better than a transformation of the wire string. Schema-level
+        // enums already honored it; parameter enums did not, so the same spec
+        // produced different variant names depending on where its enum lived.
+        // Suffix disambiguation still applies, since nothing stops a spec from
+        // declaring two names that collide once converted to an identifier.
         let variant_names: Vec<String> = values
             .iter()
-            .map(|value| {
-                let base = self.to_rust_enum_variant(value);
+            .enumerate()
+            .map(|(index, value)| {
+                let base = param
+                    .enum_varnames
+                    .as_ref()
+                    .and_then(|names| names.get(index))
+                    .map(|name| self.to_rust_enum_variant(name))
+                    .unwrap_or_else(|| self.to_rust_enum_variant(value));
                 let mut chosen = base.clone();
                 let mut suffix = 2;
                 while !used.insert(chosen.clone()) {
@@ -609,19 +1327,48 @@ impl CodeGenerator {
     }
 
     /// Generate a single operation method
-    fn generate_single_operation_method(&self, op: &OperationInfo) -> TokenStream {
+    fn generate_single_operation_method(
+        &self,
+        analysis: &SchemaAnalysis,
+        op: &OperationInfo,
+    ) -> TokenStream {
         let method_name = self.get_method_name(op);
         let http_method_call = self.http_method_call(op);
         let path = &op.path;
         let request_param = self.generate_request_param(op);
-        let request_body = self.generate_request_body(op);
+        let request_body = self.generate_request_body(op, analysis);
         let query_params = self.generate_query_params(op);
         let header_params = self.generate_header_params(op);
+        let cookie_params = self.generate_cookie_params(op);
         let auth_application = self.generate_auth_application();
-        let response_type = self.get_response_type(op);
-        let has_response_body = self.get_success_response_schema(op).is_some();
+        let success = self.get_success_response(analysis, op);
+        let response_type = self.get_response_type(analysis, op);
         let op_error_type = self.op_error_type_token(op);
-        let error_handling = self.generate_error_handling(op, has_response_body);
+        let accept = success.accept;
+        let error_handling = self.generate_error_handling(op, success);
+        let (custom_headers, accept_header) = if let Some(media_type) = accept {
+            (
+                quote! {
+                    for (name, value) in &self.custom_headers {
+                        if !name.eq_ignore_ascii_case("accept") {
+                            req = req.header(name, value);
+                        }
+                    }
+                },
+                quote! {
+                    req = req.header(reqwest::header::ACCEPT, #media_type);
+                },
+            )
+        } else {
+            (
+                quote! {
+                    for (name, value) in &self.custom_headers {
+                        req = req.header(name, value);
+                    }
+                },
+                TokenStream::new(),
+            )
+        };
         let url_construction = self.generate_url_construction(path, op);
         let doc_comment = self.generate_operation_doc_comment(op);
 
@@ -638,15 +1385,18 @@ impl CodeGenerator {
 
                 #query_params
                 #header_params
+                #cookie_params
 
                 // Apply configured authentication (T3). Was previously
                 // hardcoded to bearer_auth regardless of GeneratorConfig.
                 #auth_application
 
                 // Add custom headers
-                for (name, value) in &self.custom_headers {
-                    req = req.header(name, value);
-                }
+                #custom_headers
+
+                // Keep content negotiation aligned with the generated return type,
+                // replacing any custom Accept value for this operation.
+                #accept_header
 
                 let response = req.send().await?;
                 #error_handling
@@ -727,6 +1477,27 @@ impl CodeGenerator {
             let param_name_snake = self.param_ident_str(param);
             let param_ident = Self::to_field_ident(&param_name_snake);
             let header_name = &param.name;
+            if matches!(
+                param.query_serialization,
+                Some(crate::analysis::QuerySerialization::SimpleHeaderArray { .. })
+            ) {
+                let encode = quote! {
+                    v.iter().map(::std::string::ToString::to_string).collect::<Vec<_>>().join(",")
+                };
+                if param.required {
+                    emit.push(quote! {
+                        let v = #param_ident;
+                        req = req.header(#header_name, #encode);
+                    });
+                } else {
+                    emit.push(quote! {
+                        if let Some(v) = #param_ident {
+                            req = req.header(#header_name, #encode);
+                        }
+                    });
+                }
+                continue;
+            }
             if param.required {
                 if Self::param_uses_as_ref_str(param) {
                     emit.push(quote! {
@@ -756,6 +1527,40 @@ impl CodeGenerator {
         }
     }
 
+    fn generate_cookie_params(&self, op: &OperationInfo) -> TokenStream {
+        let cookie_params: Vec<_> = op
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.location == "cookie")
+            .collect();
+        if cookie_params.is_empty() {
+            return quote! {};
+        }
+        let mut emit = Vec::new();
+        for parameter in cookie_params {
+            let ident = Self::to_field_ident(&self.param_ident_str(parameter));
+            let wire_name = parameter.name.as_str();
+            if parameter.required {
+                emit.push(quote! {
+                    __cookie_fields.push(format!("{}={}", #wire_name, #ident));
+                });
+            } else {
+                emit.push(quote! {
+                    if let Some(value) = #ident {
+                        __cookie_fields.push(format!("{}={}", #wire_name, value));
+                    }
+                });
+            }
+        }
+        quote! {
+            let mut __cookie_fields = Vec::new();
+            #(#emit)*
+            if !__cookie_fields.is_empty() {
+                req = req.header(::reqwest::header::COOKIE, __cookie_fields.join("; "));
+            }
+        }
+    }
+
     /// Generate query parameter handling
     fn generate_query_params(&self, op: &OperationInfo) -> TokenStream {
         let query_params: Vec<_> = op
@@ -769,8 +1574,14 @@ impl CodeGenerator {
         }
 
         let mut param_building = Vec::new();
+        // Serialization applied on `req` directly, after the pair-vector
+        // block: form-exploded objects and deepObject objects, whose keys
+        // aren't the static parameter name.
+        let mut req_appends = Vec::new();
 
         for param in query_params {
+            use crate::analysis::QuerySerialization;
+
             // Use snake_case for Rust variable name with keyword escaping
             let param_name_snake = self.param_ident_str(param);
             let param_name = Self::to_field_ident(&param_name_snake);
@@ -778,15 +1589,533 @@ impl CodeGenerator {
             // Use the original parameter name from OpenAPI spec as the query string key
             let param_key = &param.name;
 
+            match &param.query_serialization {
+                Some(QuerySerialization::FormExplodedNestedObject { properties }) => {
+                    let emit_properties = properties.iter().map(|property| {
+                        let wire_name = property.wire_name.as_str();
+                        let field_ident = CodeGenerator::to_field_ident(
+                            &self.to_rust_field_name(wire_name),
+                        );
+                        match &property.value_type {
+                            crate::analysis::QueryStructPropertyType::Scalar(_) => quote! {
+                                let value = serde_json::to_value(&v.#field_ident)
+                                    .map_err(HttpError::serialization_error)?;
+                                if !value.is_null() {
+                                    let value = match value {
+                                        serde_json::Value::String(value) => value,
+                                        serde_json::Value::Bool(value) => value.to_string(),
+                                        serde_json::Value::Number(value) => value.to_string(),
+                                        _ => return Err(HttpError::serialization_error(
+                                            format!("query field `{}` did not serialize as a scalar", #wire_name)
+                                        ).into()),
+                                    };
+                                    nested_params.push((format!("{}.{}", #param_key, #wire_name), value));
+                                }
+                            },
+                            crate::analysis::QueryStructPropertyType::Object { properties } => {
+                                let leaves = properties.iter().map(|property| property.wire_name.clone()).collect::<Vec<_>>();
+                                quote! {
+                                    let value = serde_json::to_value(&v.#field_ident)
+                                        .map_err(HttpError::serialization_error)?;
+                                    if !value.is_null() {
+                                        let serde_json::Value::Object(object) = value else {
+                                            return Err(HttpError::serialization_error(format!("query field `{}` did not serialize as an object", #wire_name)).into());
+                                        };
+                                        if object.is_empty() {
+                                            nested_params.push((format!("{}.{}[]", #param_key, #wire_name), String::new()));
+                                        } else {
+                                            for leaf in [#(#leaves),*] {
+                                                let Some(value) = object.get(leaf) else { continue };
+                                                if value.is_null() { continue; }
+                                                let value = match value {
+                                                    serde_json::Value::String(value) => value.clone(),
+                                                    serde_json::Value::Bool(value) => value.to_string(),
+                                                    serde_json::Value::Number(value) => value.to_string(),
+                                                    _ => return Err(HttpError::serialization_error(format!("query field `{}` contained a non-scalar leaf", #wire_name)).into()),
+                                                };
+                                                nested_params.push((format!("{}.{}.{}", #param_key, #wire_name, leaf), value));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::analysis::QueryStructPropertyType::Array { item_type } => {
+                                let nested_properties = match item_type {
+                                    crate::analysis::ArrayItemType::FlatStructRef { properties, .. } => Some(
+                                        properties.iter().map(|property| property.wire_name.clone()).collect::<Vec<_>>()
+                                    ),
+                                    _ => None,
+                                };
+                                if let Some(nested_properties) = nested_properties {
+                                    quote! {
+                                        let values = serde_json::to_value(&v.#field_ident)
+                                            .map_err(HttpError::serialization_error)?;
+                                        if !values.is_null() {
+                                            let serde_json::Value::Array(values) = values else {
+                                                return Err(HttpError::serialization_error(
+                                                    format!("query field `{}` did not serialize as an array", #wire_name)
+                                                ).into());
+                                            };
+                                            if values.is_empty() {
+                                                nested_params.push((format!("{}.{}[]", #param_key, #wire_name), String::new()));
+                                            }
+                                            for (index, value) in values.into_iter().enumerate() {
+                                                let serde_json::Value::Object(object) = value else {
+                                                    return Err(HttpError::serialization_error(
+                                                        format!("query field `{}` contained a non-object item", #wire_name)
+                                                    ).into());
+                                                };
+                                                for leaf in [#(#nested_properties),*] {
+                                                    let Some(value) = object.get(leaf) else { continue };
+                                                    if value.is_null() { continue; }
+                                                    let value = match value {
+                                                        serde_json::Value::String(value) => value.clone(),
+                                                        serde_json::Value::Bool(value) => value.to_string(),
+                                                        serde_json::Value::Number(value) => value.to_string(),
+                                                        _ => return Err(HttpError::serialization_error(
+                                                            format!("query field `{}` contained a non-scalar leaf", #wire_name)
+                                                        ).into()),
+                                                    };
+                                                    nested_params.push((format!("{}.{}.{}.{}", #param_key, #wire_name, index + 1, leaf), value));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        let values = serde_json::to_value(&v.#field_ident)
+                                            .map_err(HttpError::serialization_error)?;
+                                        if !values.is_null() {
+                                            let serde_json::Value::Array(values) = values else {
+                                                return Err(HttpError::serialization_error(
+                                                    format!("query field `{}` did not serialize as an array", #wire_name)
+                                                ).into());
+                                            };
+                                            if values.is_empty() {
+                                                nested_params.push((format!("{}.{}[]", #param_key, #wire_name), String::new()));
+                                            }
+                                            for (index, value) in values.into_iter().enumerate() {
+                                                let value = match value {
+                                                    serde_json::Value::String(value) => value,
+                                                    serde_json::Value::Bool(value) => value.to_string(),
+                                                    serde_json::Value::Number(value) => value.to_string(),
+                                                    _ => return Err(HttpError::serialization_error(
+                                                        format!("query field `{}` contained a non-scalar item", #wire_name)
+                                                    ).into()),
+                                                };
+                                                nested_params.push((format!("{}.{}.{}", #param_key, #wire_name, index + 1), value));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }).collect::<Vec<_>>();
+                    let apply = quote! {
+                        let mut nested_params: Vec<(String, String)> = Vec::new();
+                        #(#emit_properties)*
+                        if nested_params.is_empty() {
+                            nested_params.push((format!("{}[]", #param_key), String::new()));
+                        }
+                        req = req.query(&nested_params);
+                    };
+                    if param.required {
+                        req_appends.push(quote! {{ let v = #param_name; #apply }});
+                    } else {
+                        req_appends.push(quote! { if let Some(v) = #param_name { #apply } });
+                    }
+                    continue;
+                }
+                Some(QuerySerialization::FormExplodedObject) => {
+                    // Issue #27: reqwest serializes the struct through
+                    // serde_urlencoded, so each property becomes its own
+                    // `key=value` pair; the parameter's own name never
+                    // appears in the query string (RFC 6570 form-explosion).
+                    // `name[]=` is the shared zero-cardinality marker used to
+                    // preserve Some(empty) and required-empty values.
+                    let apply = quote! {
+                        let __empty = match serde_json::to_value(&v)
+                            .map_err(HttpError::serialization_error)?
+                        {
+                            serde_json::Value::Object(map) => map.is_empty(),
+                            _ => false,
+                        };
+                        if __empty {
+                            req = req.query(&[(format!("{}[]", #param_key), String::new())]);
+                        } else {
+                            req = req.query(&v);
+                        }
+                    };
+                    if param.required {
+                        req_appends.push(quote! {
+                            {
+                                let v = #param_name;
+                                #apply
+                            }
+                        });
+                    } else {
+                        req_appends.push(quote! {
+                            if let Some(v) = #param_name {
+                                #apply
+                            }
+                        });
+                    }
+                    continue;
+                }
+                Some(QuerySerialization::DeepObject) => {
+                    // `?filter[color]=red&filter[size]=5`. Property values
+                    // stringify through their JSON form; Null (unset
+                    // Option) properties are skipped.
+                    let apply = quote! {
+                        let map = match serde_json::to_value(&v)
+                            .map_err(HttpError::serialization_error)?
+                        {
+                            serde_json::Value::Object(map) => map,
+                            _ => return Err(HttpError::serialization_error(
+                                format!("query parameter `{}` did not serialize as an object", #param_key)
+                            ).into()),
+                        };
+                        let mut deep_params: Vec<(String, String)> = Vec::new();
+                        for (k, val) in map {
+                            let s = match val {
+                                serde_json::Value::Null => continue,
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            };
+                            deep_params.push((format!("{}[{}]", #param_key, k), s));
+                        }
+                        if deep_params.is_empty() {
+                            deep_params.push((format!("{}[]", #param_key), String::new()));
+                        }
+                        req = req.query(&deep_params);
+                    };
+                    if param.required {
+                        req_appends.push(quote! {
+                            {
+                                let v = #param_name;
+                                #apply
+                            }
+                        });
+                    } else {
+                        req_appends.push(quote! {
+                            if let Some(v) = #param_name {
+                                #apply
+                            }
+                        });
+                    }
+                    continue;
+                }
+                Some(QuerySerialization::FormObject) => {
+                    // `?filter=color,red,size,big` — one pair whose value is
+                    // the comma-joined key,value list (RFC 6570 form,
+                    // explode=false).
+                    let apply = quote! {
+                        let map = match serde_json::to_value(&v)
+                            .map_err(HttpError::serialization_error)?
+                        {
+                            serde_json::Value::Object(map) => map,
+                            _ => return Err(HttpError::serialization_error(
+                                format!("query parameter `{}` did not serialize as an object", #param_key)
+                            ).into()),
+                        };
+                        let mut parts: Vec<String> = Vec::new();
+                        for (k, val) in map {
+                            let s = match val {
+                                serde_json::Value::Null => continue,
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            };
+                            if k.contains(',') || s.contains(',') {
+                                return Err(HttpError::serialization_error(
+                                    format!(
+                                        "query object `{}` contains a comma in key `{}`; use explode=true for lossless string values",
+                                        #param_key,
+                                        k,
+                                    )
+                                ).into());
+                            }
+                            parts.push(k);
+                            parts.push(s);
+                        }
+                        if parts.is_empty() {
+                            query_params.push((
+                                format!("{}[]", #param_key),
+                                String::new(),
+                            ));
+                        } else {
+                            query_params.push((#param_key.to_string(), parts.join(",")));
+                        }
+                    };
+                    if param.required {
+                        param_building.push(quote! {
+                            {
+                                let v = #param_name;
+                                #apply
+                            }
+                        });
+                    } else {
+                        param_building.push(quote! {
+                            if let Some(v) = #param_name {
+                                #apply
+                            }
+                        });
+                    }
+                    continue;
+                }
+                Some(QuerySerialization::FormExplodedArray { item_type }) => {
+                    // `?tags=a&tags=b` — one pair per element; flat structures
+                    // expand AWS query-protocol style as `?tags.1.Key=k&tags.1.Value=v`.
+                    let struct_properties = match item_type {
+                        crate::analysis::ArrayItemType::FlatStructRef { properties, .. }
+                        | crate::analysis::ArrayItemType::NestedStructRef { properties, .. } => {
+                            Some(properties.clone())
+                        }
+                        _ => None,
+                    };
+                    let emit_items = if let Some(properties) = struct_properties {
+                        let pushes = properties
+                            .iter()
+                            .map(|property| {
+                                let wire_name = &property.wire_name;
+                                // Wire names such as `Type` land on struct
+                                // fields via the same keyword-escaping the
+                                // model generator uses (`r#type`).
+                                let field_ident = CodeGenerator::to_field_ident(
+                                    &self.to_rust_field_name(wire_name),
+                                );
+                                match &property.value_type {
+                                    crate::analysis::QueryStructPropertyType::Scalar(_) => quote! {
+                                        let value = serde_json::to_value(&item.#field_ident)
+                                            .map_err(HttpError::serialization_error)?;
+                                        if !value.is_null() {
+                                            let value = match value {
+                                                serde_json::Value::String(value) => value,
+                                                serde_json::Value::Bool(value) => value.to_string(),
+                                                serde_json::Value::Number(value) => value.to_string(),
+                                                _ => return Err(HttpError::serialization_error(
+                                                    format!("query field `{}.{}` did not serialize as a scalar", #param_key, #wire_name)
+                                                ).into()),
+                                            };
+                                            query_params.push((
+                                                format!("{}.{}.{}", #param_key, index, #wire_name),
+                                                value,
+                                            ));
+                                        }
+                                    },
+                                    crate::analysis::QueryStructPropertyType::Object { properties } => {
+                                        let leaves = properties.iter().map(|property| property.wire_name.clone()).collect::<Vec<_>>();
+                                        quote! {
+                                            let value = serde_json::to_value(&item.#field_ident)
+                                                .map_err(HttpError::serialization_error)?;
+                                            if !value.is_null() {
+                                                let serde_json::Value::Object(object) = value else {
+                                                    return Err(HttpError::serialization_error(format!("query field `{}.{}` did not serialize as an object", #param_key, #wire_name)).into());
+                                                };
+                                                if object.is_empty() {
+                                                    query_params.push((format!("{}.{}.{}[]", #param_key, index, #wire_name), String::new()));
+                                                }
+                                                for leaf in [#(#leaves),*] {
+                                                    let Some(value) = object.get(leaf) else { continue };
+                                                    if value.is_null() { continue; }
+                                                    let value = match value {
+                                                        serde_json::Value::String(value) => value.clone(),
+                                                        serde_json::Value::Bool(value) => value.to_string(),
+                                                        serde_json::Value::Number(value) => value.to_string(),
+                                                        _ => return Err(HttpError::serialization_error(format!("query field `{}.{}` contained a non-scalar leaf", #param_key, #wire_name)).into()),
+                                                    };
+                                                    query_params.push((format!("{}.{}.{}.{}", #param_key, index, #wire_name, leaf), value));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    crate::analysis::QueryStructPropertyType::Array { item_type } => {
+                                        let nested_properties = match item_type {
+                                            crate::analysis::ArrayItemType::FlatStructRef { properties, .. } => {
+                                                Some(properties.iter().map(|property| property.wire_name.clone()).collect::<Vec<_>>())
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(nested_properties) = nested_properties {
+                                            quote! {
+                                                let values = serde_json::to_value(&item.#field_ident)
+                                                    .map_err(HttpError::serialization_error)?;
+                                                if !values.is_null() {
+                                                    let serde_json::Value::Array(values) = values else {
+                                                        return Err(HttpError::serialization_error(
+                                                            format!("query field `{}.{}` did not serialize as an array", #param_key, #wire_name)
+                                                        ).into());
+                                                    };
+                                                    if values.is_empty() {
+                                                        query_params.push((format!("{}.{}.{}[]", #param_key, index, #wire_name), String::new()));
+                                                    }
+                                                    for (nested_index, value) in values.into_iter().enumerate() {
+                                                        let serde_json::Value::Object(object) = value else {
+                                                            return Err(HttpError::serialization_error(
+                                                                format!("query field `{}.{}` contained a non-object item", #param_key, #wire_name)
+                                                            ).into());
+                                                        };
+                                                        if object.is_empty() {
+                                                            query_params.push((format!("{}.{}.{}.{}[]", #param_key, index, #wire_name, nested_index + 1), String::new()));
+                                                        }
+                                                        for nested_wire_name in [#(#nested_properties),*] {
+                                                            let Some(value) = object.get(nested_wire_name) else { continue };
+                                                            if value.is_null() { continue; }
+                                                            let value = match value {
+                                                                serde_json::Value::String(value) => value.clone(),
+                                                                serde_json::Value::Bool(value) => value.to_string(),
+                                                                serde_json::Value::Number(value) => value.to_string(),
+                                                                _ => return Err(HttpError::serialization_error(
+                                                                    format!("query field `{}.{}` contained a non-scalar leaf", #param_key, #wire_name)
+                                                                ).into()),
+                                                            };
+                                                            query_params.push((
+                                                                format!("{}.{}.{}.{}.{}", #param_key, index, #wire_name, nested_index + 1, nested_wire_name),
+                                                                value,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            quote! {
+                                                let values = serde_json::to_value(&item.#field_ident)
+                                                    .map_err(HttpError::serialization_error)?;
+                                                if !values.is_null() {
+                                                    let serde_json::Value::Array(values) = values else {
+                                                        return Err(HttpError::serialization_error(
+                                                            format!("query field `{}.{}` did not serialize as an array", #param_key, #wire_name)
+                                                        ).into());
+                                                    };
+                                                    if values.is_empty() {
+                                                        query_params.push((format!("{}.{}.{}[]", #param_key, index, #wire_name), String::new()));
+                                                    }
+                                                    for (nested_index, value) in values.into_iter().enumerate() {
+                                                        let value = match value {
+                                                            serde_json::Value::String(value) => value,
+                                                            serde_json::Value::Bool(value) => value.to_string(),
+                                                            serde_json::Value::Number(value) => value.to_string(),
+                                                            _ => return Err(HttpError::serialization_error(
+                                                                format!("query field `{}.{}` contained a non-scalar item", #param_key, #wire_name)
+                                                            ).into()),
+                                                        };
+                                                        query_params.push((
+                                                            format!("{}.{}.{}.{}", #param_key, index, #wire_name, nested_index + 1),
+                                                            value,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        quote! {
+                            for (index, item) in v.iter().enumerate() {
+                                let index = index + 1;
+                                let item_start_len = query_params.len();
+                                #(#pushes)*
+                                if query_params.len() == item_start_len {
+                                    query_params.push((format!("{}.{}[]", #param_key, index), String::new()));
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            for item in v {
+                                query_params.push((#param_key.to_string(), item.to_string()));
+                            }
+                        }
+                    };
+                    if param.required {
+                        param_building.push(quote! {
+                            let v = #param_name;
+                            if v.is_empty() {
+                                query_params.push((
+                                    format!("{}[]", #param_key),
+                                    String::new(),
+                                ));
+                            } else {
+                                #emit_items
+                            }
+                        });
+                    } else {
+                        param_building.push(quote! {
+                            if let Some(v) = #param_name {
+                                if v.is_empty() {
+                                    query_params.push((
+                                        format!("{}[]", #param_key),
+                                        String::new(),
+                                    ));
+                                } else {
+                                    #emit_items
+                                }
+                            }
+                        });
+                    }
+                    continue;
+                }
+                Some(QuerySerialization::FormArray { .. }) => {
+                    // `?tags=a,b,c` — one comma-joined pair. Empty vectors
+                    // use the shared `tags[]=` zero-cardinality marker.
+                    let apply = quote! {
+                        if v.is_empty() {
+                            query_params.push((
+                                format!("{}[]", #param_key),
+                                String::new(),
+                            ));
+                        } else {
+                            let mut parts = Vec::with_capacity(v.len());
+                            for item in &v {
+                                let item = item.to_string();
+                                if item.contains(',') {
+                                    return Err(HttpError::serialization_error(
+                                        format!(
+                                            "query array `{}` contains a comma; use explode=true for lossless string values",
+                                            #param_key,
+                                        )
+                                    ).into());
+                                }
+                                parts.push(item);
+                            }
+                            query_params.push((
+                                #param_key.to_string(),
+                                parts.join(","),
+                            ));
+                        }
+                    };
+                    if param.required {
+                        param_building.push(quote! {
+                            {
+                                let v = #param_name;
+                                #apply
+                            }
+                        });
+                    } else {
+                        param_building.push(quote! {
+                            if let Some(v) = #param_name {
+                                #apply
+                            }
+                        });
+                    }
+                    continue;
+                }
+                Some(
+                    QuerySerialization::Unsupported { .. }
+                    | QuerySerialization::SimpleHeaderArray { .. },
+                ) => {}
+                None => {}
+            }
+
             if param.required {
                 // Required parameters: always add
                 if Self::param_uses_as_ref_str(param) {
                     param_building.push(quote! {
-                        query_params.push((#param_key, #param_name.as_ref().to_string()));
+                        query_params.push((#param_key.to_string(), #param_name.as_ref().to_string()));
                     });
                 } else {
                     param_building.push(quote! {
-                        query_params.push((#param_key, #param_name.to_string()));
+                        query_params.push((#param_key.to_string(), #param_name.to_string()));
                     });
                 }
             } else {
@@ -794,28 +2123,39 @@ impl CodeGenerator {
                 if Self::param_uses_as_ref_str(param) {
                     param_building.push(quote! {
                         if let Some(v) = #param_name {
-                            query_params.push((#param_key, v.as_ref().to_string()));
+                            query_params.push((#param_key.to_string(), v.as_ref().to_string()));
                         }
                     });
                 } else {
                     param_building.push(quote! {
                         if let Some(v) = #param_name {
-                            query_params.push((#param_key, v.to_string()));
+                            query_params.push((#param_key.to_string(), v.to_string()));
                         }
                     });
                 }
             }
         }
 
-        quote! {
-            // Add query parameters
-            {
-                let mut query_params: Vec<(&str, String)> = Vec::new();
-                #(#param_building)*
-                if !query_params.is_empty() {
-                    req = req.query(&query_params);
+        // Ops whose query params all serialize on `req` directly skip the
+        // pair-vector block entirely.
+        let pairs_block = if param_building.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                {
+                    let mut query_params: Vec<(String, String)> = Vec::new();
+                    #(#param_building)*
+                    if !query_params.is_empty() {
+                        req = req.query(&query_params);
+                    }
                 }
             }
+        };
+
+        quote! {
+            // Add query parameters
+            #pairs_block
+            #(#req_appends)*
         }
     }
 
@@ -971,26 +2311,58 @@ impl CodeGenerator {
             }
         }
 
+        for param in &op.parameters {
+            if param.location == "cookie" {
+                let param_name_snake = self.param_ident_str(param);
+                let param_name = unique_param_ident(param_name_snake);
+                let param_type = self.get_param_rust_type(param);
+                if param.required {
+                    params.push(quote! { #param_name: #param_type });
+                } else {
+                    params.push(quote! { #param_name: Option<#param_type> });
+                }
+            }
+        }
+
         // Add request body parameter based on content type. Optional bodies
         // (`requestBody.required` is false or absent) become `Option<T>` per T11.
         if let Some(ref rb) = op.request_body {
             use crate::analysis::RequestBodyContent;
+            if matches!(rb, RequestBodyContent::SchemaLess { .. }) {
+                return if params.is_empty() {
+                    quote! {}
+                } else {
+                    quote! { #(#params),* }
+                };
+            }
             let required = op.request_body_required;
             let body_type = match rb {
-                RequestBodyContent::Json { schema_name }
-                | RequestBodyContent::FormUrlEncoded { schema_name } => {
+                RequestBodyContent::Json { schema_name, .. }
+                | RequestBodyContent::FormUrlEncoded { schema_name, .. }
+                | RequestBodyContent::Multipart { schema_name, .. } => {
                     let rust_type_name = self.to_rust_type_name(schema_name);
                     let request_ident =
                         syn::Ident::new(&rust_type_name, proc_macro2::Span::call_site());
                     quote! { #request_ident }
                 }
-                RequestBodyContent::Multipart => quote! { reqwest::multipart::Form },
-                RequestBodyContent::OctetStream => quote! { Vec<u8> },
-                RequestBodyContent::TextPlain => quote! { String },
+
+                RequestBodyContent::OctetStream { .. } | RequestBodyContent::Binary { .. } => {
+                    quote! { Vec<u8> }
+                }
+                RequestBodyContent::TextPlain { .. } => quote! { String },
+                RequestBodyContent::Unsupported { .. } => quote! { Vec<u8> },
+                RequestBodyContent::SchemaLess { .. } => unreachable!(
+                    "schema-less request bodies preserve the historical client signature"
+                ),
             };
             let body_ident = match rb {
-                RequestBodyContent::Multipart => quote! { form },
-                RequestBodyContent::OctetStream | RequestBodyContent::TextPlain => quote! { body },
+                RequestBodyContent::OctetStream { .. }
+                | RequestBodyContent::Binary { .. }
+                | RequestBodyContent::TextPlain { .. }
+                | RequestBodyContent::Unsupported { .. } => quote! { body },
+                RequestBodyContent::SchemaLess { .. } => unreachable!(
+                    "schema-less request bodies preserve the historical client signature"
+                ),
                 _ => quote! { request },
             };
             if required {
@@ -1009,6 +2381,54 @@ impl CodeGenerator {
 
     /// Get the Rust type for a parameter
     fn get_param_rust_type(&self, param: &crate::analysis::ParameterInfo) -> TokenStream {
+        if Self::param_has_impl_as_ref_type(param) {
+            quote! { impl AsRef<str> }
+        } else {
+            self.get_param_owned_rust_type(param)
+        }
+    }
+
+    /// Owned parameter type shared by client-builder storage and generated
+    /// server extraction. [`ParameterInfo::query_serialization`] is the
+    /// authoritative projection for typed query objects and arrays.
+    pub(crate) fn get_param_owned_rust_type(
+        &self,
+        param: &crate::analysis::ParameterInfo,
+    ) -> TokenStream {
+        use crate::analysis::QuerySerialization;
+        // Typed form-style arrays take Vec<item> (openapi-generator-anu).
+        // Scalars parse as-is (they may be type paths from [type_mappings]);
+        // schema refs are raw schema names and go through the same
+        // to_rust_type_name sanitization as every other schema reference
+        // (cloudflare has enum schemas like `resource-sharing_resource_type`).
+        if let Some(
+            QuerySerialization::FormExplodedArray { item_type }
+            | QuerySerialization::FormArray { item_type }
+            | QuerySerialization::SimpleHeaderArray { item_type },
+        ) = &param.query_serialization
+        {
+            use crate::analysis::ArrayItemType;
+            let item_ty: syn::Type = match item_type {
+                ArrayItemType::Scalar(rust_type) => syn::parse_str(rust_type)
+                    .unwrap_or_else(|_| panic!("invalid scalar item type `{rust_type}`")),
+                ArrayItemType::SchemaRef(schema_name) => {
+                    let rust_name = self.to_rust_type_name(schema_name);
+                    syn::parse_str(&rust_name)
+                        .unwrap_or_else(|_| panic!("invalid schema item type `{rust_name}`"))
+                }
+                ArrayItemType::FlatStructRef { schema_name, .. } => {
+                    let rust_name = self.to_rust_type_name(schema_name);
+                    syn::parse_str(&rust_name)
+                        .unwrap_or_else(|_| panic!("invalid struct item type `{rust_name}`"))
+                }
+                ArrayItemType::NestedStructRef { schema_name, .. } => {
+                    let rust_name = self.to_rust_type_name(schema_name);
+                    syn::parse_str(&rust_name)
+                        .unwrap_or_else(|_| panic!("invalid nested struct item type `{rust_name}`"))
+                }
+            };
+            return quote! { Vec<#item_ty> };
+        }
         // T10: $ref-typed parameters used to lose their type because we only
         // consulted `rust_type` (which stays "String"). Now: prefer the
         // resolved schema reference if present.
@@ -1017,18 +2437,12 @@ impl CodeGenerator {
             let ident = syn::Ident::new(&rust_name, proc_macro2::Span::call_site());
             return quote! { #ident };
         }
-        let type_str = &param.rust_type;
-        match type_str.as_str() {
-            "String" => quote! { impl AsRef<str> },
-            "i64" => quote! { i64 },
-            "i32" => quote! { i32 },
-            "f64" => quote! { f64 },
-            "bool" => quote! { bool },
-            _ => {
-                let type_ident = syn::Ident::new(type_str, proc_macro2::Span::call_site());
+        syn::parse_str::<syn::Type>(&param.rust_type)
+            .map(|ty| quote! { #ty })
+            .unwrap_or_else(|_| {
+                let type_ident = syn::Ident::new(&param.rust_type, proc_macro2::Span::call_site());
                 quote! { #type_ident }
-            }
-        }
+            })
     }
 
     /// True when the parameter's compile-time type is `impl AsRef<str>` and
@@ -1039,55 +2453,302 @@ impl CodeGenerator {
         param.schema_ref.is_none() && param.rust_type == "String"
     }
 
+    fn resolve_multipart_wire_schema<'a>(
+        schema: &'a serde_json::Value,
+        analysis: &'a SchemaAnalysis,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Option<&'a serde_json::Value> {
+        let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str) else {
+            return Some(schema);
+        };
+        let name = reference.strip_prefix("#/components/schemas/")?;
+        if !visited.insert(name.to_string()) {
+            return None;
+        }
+        let resolved = analysis.validation_context.component_schemas.get(name)?;
+        Self::resolve_multipart_wire_schema(resolved, analysis, visited)
+    }
+
+    fn multipart_client_field_kind(
+        schema_type: &crate::analysis::SchemaType,
+        analysis: &SchemaAnalysis,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Option<MultipartClientFieldKind> {
+        match schema_type {
+            crate::analysis::SchemaType::Primitive {
+                rust_type,
+                serde_with,
+            } => {
+                let rust_type = rust_type.replace(' ', "");
+                if rust_type == "bytes::Bytes" {
+                    Some(MultipartClientFieldKind::RawBytes)
+                } else if serde_with
+                    .as_deref()
+                    .is_some_and(|codec| codec.contains("base64_url"))
+                {
+                    Some(MultipartClientFieldKind::Base64UrlUnpadded)
+                } else if serde_with
+                    .as_deref()
+                    .is_some_and(|codec| codec.contains("base64"))
+                    || rust_type == "Vec<u8>"
+                {
+                    Some(MultipartClientFieldKind::Base64)
+                } else {
+                    Some(MultipartClientFieldKind::Text)
+                }
+            }
+            crate::analysis::SchemaType::StringEnum { .. }
+            | crate::analysis::SchemaType::ExtensibleEnum { .. } => {
+                Some(MultipartClientFieldKind::Text)
+            }
+            crate::analysis::SchemaType::Reference { target } => {
+                if !visited.insert(target.clone()) {
+                    return None;
+                }
+                analysis.schemas.get(target).and_then(|schema| {
+                    Self::multipart_client_field_kind(&schema.schema_type, analysis, visited)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn generate_typed_multipart_form(
+        &self,
+        schema_name: &str,
+        validation_schema: &serde_json::Value,
+        analysis: &SchemaAnalysis,
+    ) -> TokenStream {
+        use crate::analysis::{ObjectAdditionalProperties, SchemaType};
+
+        let Some((resolved_name, resolved_schema)) =
+            self.resolve_reference_schema(schema_name, analysis)
+        else {
+            let message = format!(
+                "multipart request schema `{schema_name}` could not be resolved during generation"
+            );
+            return quote! {
+                return Err(HttpError::Config(#message.to_string()).into());
+            };
+        };
+        let SchemaType::Object {
+            properties,
+            required,
+            additional_properties,
+        } = &resolved_schema.schema_type
+        else {
+            let message =
+                format!("multipart request schema `{schema_name}` must resolve to an object");
+            return quote! {
+                return Err(HttpError::Config(#message.to_string()).into());
+            };
+        };
+        let wire_schema = Self::resolve_multipart_wire_schema(
+            validation_schema,
+            analysis,
+            &mut std::collections::HashSet::new(),
+        );
+        let wire_properties = wire_schema
+            .and_then(|schema| schema.get("properties"))
+            .and_then(serde_json::Value::as_object);
+        let fields = self.emitted_object_properties(
+            resolved_name,
+            properties,
+            required,
+            additional_properties,
+            analysis,
+            None,
+        );
+        if matches!(
+            additional_properties,
+            ObjectAdditionalProperties::Typed { .. }
+        ) {
+            let message = format!(
+                "multipart request schema `{schema_name}` cannot contain typed additional properties"
+            );
+            return quote! {
+                return Err(HttpError::Config(#message.to_string()).into());
+            };
+        }
+
+        let mut parts = Vec::new();
+        for field in fields {
+            let wire_name = field.wire_name;
+            let ident = field.ident;
+            let wire_format = wire_properties
+                .and_then(|properties| properties.get(wire_name))
+                .and_then(|schema| {
+                    Self::resolve_multipart_wire_schema(
+                        schema,
+                        analysis,
+                        &mut std::collections::HashSet::new(),
+                    )
+                })
+                .and_then(|schema| schema.get("format"))
+                .and_then(serde_json::Value::as_str);
+            let kind = if wire_format == Some("binary") {
+                match self.config().types.binary {
+                    crate::type_mapping::BinaryStrategy::String => MultipartClientFieldKind::Text,
+                    crate::type_mapping::BinaryStrategy::Bytes
+                    | crate::type_mapping::BinaryStrategy::VecU8 => {
+                        MultipartClientFieldKind::RawBytes
+                    }
+                }
+            } else if let Some(kind) = Self::multipart_client_field_kind(
+                &field.property.schema_type,
+                analysis,
+                &mut std::collections::HashSet::new(),
+            ) {
+                kind
+            } else {
+                let message =
+                    format!("multipart field `{wire_name}` must be binary or a scalar text field");
+                return quote! {
+                    return Err(HttpError::Config(#message.to_string()).into());
+                };
+            };
+            let add_value = match kind {
+                MultipartClientFieldKind::RawBytes => quote! {
+                    form = form.part(
+                        #wire_name,
+                        reqwest::multipart::Part::bytes(value.to_vec()),
+                    );
+                },
+                MultipartClientFieldKind::Base64 => quote! {
+                    use base64::Engine as _;
+                    form = form.text(
+                        #wire_name,
+                        base64::engine::general_purpose::STANDARD.encode(value),
+                    );
+                },
+                MultipartClientFieldKind::Base64UrlUnpadded => quote! {
+                    use base64::Engine as _;
+                    form = form.text(
+                        #wire_name,
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value),
+                    );
+                },
+                MultipartClientFieldKind::Text => quote! {
+                    form = form.text(#wire_name, value.to_string());
+                },
+            };
+            parts.push(if field.is_required {
+                quote! {
+                    let value = &request.#ident;
+                    #add_value
+                }
+            } else {
+                quote! {
+                    if let Some(value) = &request.#ident {
+                        #add_value
+                    }
+                }
+            });
+        }
+
+        quote! {
+            let mut form = reqwest::multipart::Form::new();
+            #(#parts)*
+            req = req.multipart(form);
+        }
+    }
+
     /// Generate request body serialization based on content type
     /// Emit statements that mutate `req` to apply the request body. Returns
-    /// `quote!{}` if the operation has no body. Optional bodies (T11) gate the
-    /// application on `Some(_)`; required bodies apply unconditionally.
-    fn generate_request_body(&self, op: &OperationInfo) -> TokenStream {
+    /// explicit zero-length framing for bodyless POST, PUT, and PATCH requests.
+    /// Optional bodies (T11) gate the application on `Some(_)`; required bodies
+    /// apply unconditionally.
+    fn generate_request_body(&self, op: &OperationInfo, analysis: &SchemaAnalysis) -> TokenStream {
+        let empty_request_framing = Self::generate_empty_request_framing(op);
         let Some(rb) = op.request_body.as_ref() else {
-            return quote! {};
+            return empty_request_framing;
         };
         use crate::analysis::RequestBodyContent;
         let required = op.request_body_required;
         let (ident, apply): (TokenStream, TokenStream) = match rb {
-            RequestBodyContent::Json { .. } => (
+            RequestBodyContent::Json { media_type, .. } => (
                 quote! { request },
                 quote! {
                     req = req
                         .body(serde_json::to_vec(&request).map_err(HttpError::serialization_error)?)
-                        .header("content-type", "application/json");
+                        .header("content-type", #media_type);
                 },
             ),
-            RequestBodyContent::FormUrlEncoded { .. } => (
+            RequestBodyContent::FormUrlEncoded { media_type, .. } => (
                 quote! { request },
                 quote! {
                     req = req
                         .body(serde_urlencoded::to_string(&request).map_err(HttpError::serialization_error)?)
-                        .header("content-type", "application/x-www-form-urlencoded");
+                        .header("content-type", #media_type);
                 },
             ),
-            RequestBodyContent::Multipart => (
-                quote! { form },
-                quote! {
-                    req = req.multipart(form);
-                },
+            RequestBodyContent::Multipart {
+                schema_name,
+                validation_schema,
+                ..
+            } => (
+                quote! { request },
+                self.generate_typed_multipart_form(schema_name, validation_schema, analysis),
             ),
-            RequestBodyContent::OctetStream => (
+            RequestBodyContent::OctetStream { media_type } => (
                 quote! { body },
                 quote! {
                     req = req
                         .body(body)
-                        .header("content-type", "application/octet-stream");
+                        .header("content-type", #media_type);
                 },
             ),
-            RequestBodyContent::TextPlain => (
+            RequestBodyContent::Binary { media_type } => (
                 quote! { body },
                 quote! {
                     req = req
                         .body(body)
-                        .header("content-type", "text/plain");
+                        .header("content-type", #media_type);
                 },
             ),
+            RequestBodyContent::TextPlain { media_type } => (
+                quote! { body },
+                quote! {
+                    req = req
+                        .body(body)
+                        .header("content-type", #media_type);
+                },
+            ),
+            RequestBodyContent::Unsupported { media_types } => {
+                let media_type = media_types
+                    .iter()
+                    .find(|media_type| !crate::openapi::is_wildcard_media_type(media_type))
+                    .map(String::as_str);
+                let Some(media_type) = media_type else {
+                    let ranges = media_types.join(", ");
+                    let message = format!(
+                        "request body for operation `{}` declares only wildcard media ranges ({ranges}); a concrete Content-Type is required",
+                        op.operation_id,
+                    );
+                    return if required {
+                        quote! {
+                            let _ = body;
+                            return Err(HttpError::Config(#message.to_string()).into());
+                        }
+                    } else {
+                        quote! {
+                            if body.is_some() {
+                                return Err(HttpError::Config(#message.to_string()).into());
+                            }
+                            #empty_request_framing
+                        }
+                    };
+                };
+                (
+                    quote! { body },
+                    quote! {
+                        req = req
+                            .body(body)
+                            .header("content-type", #media_type);
+                    },
+                )
+            }
+            RequestBodyContent::SchemaLess { .. } => return empty_request_framing,
         };
         if required {
             apply
@@ -1095,8 +2756,27 @@ impl CodeGenerator {
             quote! {
                 if let Some(#ident) = #ident {
                     #apply
+                } else {
+                    #empty_request_framing
                 }
             }
+        }
+    }
+
+    /// Emit explicit HTTP/1.1 framing when an operation sends no request body.
+    /// RFC 9110 recommends `Content-Length: 0` for methods that define request
+    /// content semantics. Methods without those semantics intentionally remain
+    /// unchanged.
+    fn generate_empty_request_framing(op: &OperationInfo) -> TokenStream {
+        if ["POST", "PUT", "PATCH"]
+            .iter()
+            .any(|method| op.method.eq_ignore_ascii_case(method))
+        {
+            quote! {
+                req = req.header(reqwest::header::CONTENT_LENGTH, "0");
+            }
+        } else {
+            quote! {}
         }
     }
 
@@ -1105,49 +2785,244 @@ impl CodeGenerator {
     /// Only considers 2xx status codes. Error schemas (4xx, 5xx) are ignored
     /// so that endpoints like 204 No Content correctly return `()` instead of
     /// accidentally picking up the error schema (e.g. `BadRequestError`).
-    fn get_success_response_schema<'a>(&self, op: &'a OperationInfo) -> Option<&'a String> {
+    fn get_success_response_schema<'a>(
+        &self,
+        op: &'a OperationInfo,
+    ) -> Option<(&'a str, &'a String)> {
         op.response_schemas
-            .get("200")
-            .or_else(|| op.response_schemas.get("201"))
+            .get_key_value("200")
+            .or_else(|| op.response_schemas.get_key_value("201"))
             .or_else(|| {
                 op.response_schemas
                     .iter()
                     .find(|(code, _)| code.starts_with('2'))
-                    .map(|(_, v)| v)
             })
+            .map(|(status, schema)| (status.as_str(), schema))
+    }
+
+    fn get_success_response<'a>(
+        &self,
+        analysis: &'a SchemaAnalysis,
+        op: &'a OperationInfo,
+    ) -> ClientSuccessSelection<'a> {
+        if let Some(responses) = analysis.operation_responses.get(&op.operation_id) {
+            let mut candidates = Vec::new();
+            for preferred in ["200", "201"] {
+                if let Some((status, response)) = responses.get_key_value(preferred) {
+                    candidates.push((status.as_str(), response));
+                }
+            }
+            candidates.extend(
+                responses
+                    .iter()
+                    .filter(|(status, _)| {
+                        status.starts_with('2')
+                            && status.as_str() != "200"
+                            && status.as_str() != "201"
+                    })
+                    .map(|(status, response)| (status.as_str(), response)),
+            );
+
+            let selected = candidates
+                .iter()
+                .copied()
+                .find(|(_, response)| {
+                    matches!(
+                        Self::response_body(response),
+                        ClientSuccessBody::Json(_)
+                            | ClientSuccessBody::Text
+                            | ClientSuccessBody::Binary
+                    )
+                })
+                .or_else(|| {
+                    candidates.iter().copied().find(|(_, response)| {
+                        matches!(
+                            Self::response_body(response),
+                            ClientSuccessBody::EventStream
+                        )
+                    })
+                })
+                .or_else(|| candidates.first().copied());
+
+            if let Some((_, response)) = selected {
+                let body = Self::response_body(response);
+                let statuses = candidates
+                    .iter()
+                    .filter_map(|(status, candidate)| {
+                        Self::success_bodies_are_compatible(body, Self::response_body(candidate))
+                            .then_some(*status)
+                    })
+                    .collect();
+                let accept = match &response.body {
+                    Some(OperationResponseBody::Json { media_type, .. })
+                    | Some(OperationResponseBody::Text { media_type }) => Some(media_type.as_str()),
+                    Some(OperationResponseBody::Binary {
+                        media_type,
+                        wildcard,
+                    }) => (!wildcard).then_some(media_type.as_str()),
+                    None if response.schema_name.is_some() => {
+                        response.media_type.as_deref().or(Some("application/json"))
+                    }
+                    None if response.supports_streaming => Some("text/event-stream"),
+                    None => None,
+                };
+                return ClientSuccessSelection {
+                    statuses,
+                    body,
+                    accept,
+                };
+            }
+        }
+
+        if let Some((_status, schema_name)) = self.get_success_response_schema(op) {
+            let statuses = op
+                .response_schemas
+                .iter()
+                .filter_map(|(candidate_status, candidate_schema)| {
+                    (candidate_status.starts_with('2') && candidate_schema == schema_name)
+                        .then_some(candidate_status.as_str())
+                })
+                .collect();
+            ClientSuccessSelection {
+                statuses,
+                body: ClientSuccessBody::Json(schema_name),
+                accept: Some("application/json"),
+            }
+        } else if Self::returns_raw_event_stream(op) {
+            ClientSuccessSelection {
+                statuses: Vec::new(),
+                body: ClientSuccessBody::EventStream,
+                accept: Some("text/event-stream"),
+            }
+        } else {
+            ClientSuccessSelection {
+                statuses: Vec::new(),
+                body: ClientSuccessBody::Empty,
+                accept: None,
+            }
+        }
+    }
+
+    fn response_body(response: &crate::analysis::OperationResponse) -> ClientSuccessBody<'_> {
+        match &response.body {
+            Some(OperationResponseBody::Json { schema_name, .. }) => {
+                ClientSuccessBody::Json(schema_name)
+            }
+            Some(OperationResponseBody::Text { .. }) => ClientSuccessBody::Text,
+            Some(OperationResponseBody::Binary { .. }) => ClientSuccessBody::Binary,
+            None if response.schema_name.is_some() => {
+                ClientSuccessBody::Json(response.schema_name.as_deref().unwrap_or_default())
+            }
+            None if response.supports_streaming => ClientSuccessBody::EventStream,
+            None => ClientSuccessBody::Empty,
+        }
+    }
+
+    fn success_bodies_are_compatible(
+        selected: ClientSuccessBody<'_>,
+        candidate: ClientSuccessBody<'_>,
+    ) -> bool {
+        match (selected, candidate) {
+            (ClientSuccessBody::Json(selected), ClientSuccessBody::Json(candidate)) => {
+                selected == candidate
+            }
+            (ClientSuccessBody::Text, ClientSuccessBody::Text)
+            | (ClientSuccessBody::Binary, ClientSuccessBody::Binary)
+            | (ClientSuccessBody::EventStream, ClientSuccessBody::EventStream)
+            | (ClientSuccessBody::Empty, ClientSuccessBody::Empty) => true,
+            _ => false,
+        }
     }
 
     /// Get response type
-    fn get_response_type(&self, op: &OperationInfo) -> TokenStream {
-        if let Some(response_type) = self.get_success_response_schema(op) {
-            // Convert schema name to Rust type name (handles underscores, etc.)
-            let rust_type_name = self.to_rust_type_name(response_type);
-            let response_ident = syn::Ident::new(&rust_type_name, proc_macro2::Span::call_site());
-            quote! { #response_ident }
-        } else {
-            quote! { () }
+    fn get_response_type(&self, analysis: &SchemaAnalysis, op: &OperationInfo) -> TokenStream {
+        match self.get_success_response(analysis, op).body {
+            ClientSuccessBody::Json(response_type) => {
+                // Convert schema name to Rust type name (handles underscores, etc.)
+                let rust_type_name = self.to_rust_type_name(response_type);
+                let response_ident =
+                    syn::Ident::new(&rust_type_name, proc_macro2::Span::call_site());
+                quote! { #response_ident }
+            }
+            ClientSuccessBody::Text => quote! { String },
+            ClientSuccessBody::Binary => quote! { bytes::Bytes },
+            ClientSuccessBody::EventStream => {
+                quote! { impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> }
+            }
+            ClientSuccessBody::Empty => quote! { () },
         }
+    }
+
+    fn success_status_guard(statuses: &[&str]) -> TokenStream {
+        if statuses.is_empty() {
+            return quote! { status.is_success() };
+        }
+        let guards = statuses
+            .iter()
+            .map(|status| Self::single_status_guard(status));
+        quote! { false #( || #guards )* }
+    }
+
+    fn single_status_guard(status: &str) -> TokenStream {
+        match status {
+            status if status.chars().all(|character| character.is_ascii_digit()) => {
+                let status: u16 = status.parse().unwrap_or_default();
+                quote! { status_code == #status }
+            }
+            status if matches!(status.as_bytes(), [b'1'..=b'5', b'X' | b'x', b'X' | b'x']) => {
+                let class = u16::from(status.as_bytes()[0] - b'0');
+                quote! { status_code / 100 == #class }
+            }
+            _ => quote! { status.is_success() },
+        }
+    }
+
+    /// True when the operation's success response carries `text/event-stream`
+    /// and nothing this generator can model as a JSON body.
+    ///
+    /// These previously generated `-> Result<(), _>` and then called
+    /// `response.text().await`, which on a live SSE stream never returns: the
+    /// caller's task deadlocks rather than erroring (openapi-generator-x9v).
+    /// The streaming signal was already detected in analysis and honored by the
+    /// server generator; only the client ignored it.
+    ///
+    /// Operations declaring *both* a JSON body and `text/event-stream` keep
+    /// their JSON contract here — those are the `stream: true` style endpoints
+    /// covered by the explicit `[streaming]` configuration, and silently
+    /// changing their return type would break existing callers.
+    fn returns_raw_event_stream(op: &OperationInfo) -> bool {
+        op.supports_streaming
     }
 
     /// Generate error handling.
     ///
-    /// Always reads the response body to a string before attempting any typed
-    /// deserialization, so the raw body and headers are preserved on the error
-    /// path even when JSON parsing fails. On 2xx the body is parsed into the
-    /// success type; on non-2xx the body is parsed into the matching variant
-    /// of the per-operation error enum (when one is declared) and wrapped in
-    /// `ApiError<E>`.
-    fn generate_error_handling(&self, op: &OperationInfo, has_response_body: bool) -> TokenStream {
+    /// Buffers non-streaming responses once, retaining both exact bytes and a
+    /// lossy UTF-8 view for compatibility. Only the selected declared success
+    /// status is parsed into the generated return type; other 2xx statuses are
+    /// inspectable `ApiError`s rather than being fed to an incompatible parser.
+    fn generate_error_handling(
+        &self,
+        op: &OperationInfo,
+        success: ClientSuccessSelection<'_>,
+    ) -> TokenStream {
         let op_error_type = self.op_error_type_token(op);
+        let success_body = success.body;
+        let success_status_guard = Self::success_status_guard(&success.statuses);
+        let selected_status = if success.statuses.is_empty() {
+            "any declared 2xx response".to_string()
+        } else {
+            success.statuses.join(", ")
+        };
 
-        let success_branch = if has_response_body {
-            quote! {
+        let success_branch = match success_body {
+            ClientSuccessBody::Json(_) => quote! {
                 match serde_json::from_str(&body_text) {
                     Ok(body) => Ok(body),
                     Err(e) => Err(ApiOpError::Api(ApiError {
                         status: status_code,
                         headers: headers,
                         body: body_text,
+                        raw_body,
                         typed: None,
                         parse_error: Some(format!(
                             "failed to deserialize 2xx response body: {}",
@@ -1155,26 +3030,140 @@ impl CodeGenerator {
                         )),
                     })),
                 }
-            }
-        } else {
-            quote! {
+            },
+            ClientSuccessBody::Text => quote! {
+                let _ = raw_body;
+                Ok(body_text)
+            },
+            ClientSuccessBody::Empty => quote! {
                 let _ = body_text;
+                let _ = raw_body;
                 let _ = headers;
                 Ok(())
-            }
+            },
+            ClientSuccessBody::Binary | ClientSuccessBody::EventStream => quote! {},
         };
 
         let error_match_arms = self.generate_error_match_arms(op);
+
+        // Streaming success path: hand back the live byte stream instead of
+        // buffering it. Reading an SSE body to a string blocks until the server
+        // closes the connection, which is precisely what it will not do.
+        // The error path still buffers — an error response is finite.
+        if matches!(success_body, ClientSuccessBody::EventStream) {
+            return quote! {
+                let status = response.status();
+                let status_code = status.as_u16();
+                let headers = response.headers().clone();
+
+                if #success_status_guard {
+                    Ok(response.bytes_stream())
+                } else {
+                    if status.is_success() {
+                        return Err(ApiOpError::Api(ApiError {
+                            status: status_code,
+                            headers,
+                            body: String::new(),
+                            raw_body: Vec::new(),
+                            typed: None,
+                            parse_error: Some(format!(
+                                "unexpected successful status {}; generated return type selects `{}`; live response body was not buffered",
+                                status_code,
+                                #selected_status,
+                            )),
+                        }));
+                    }
+                    let body_bytes = __read_bounded_response_body(
+                        response,
+                        self.max_response_body_bytes,
+                    ).await?;
+                    let raw_body = body_bytes;
+                    let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                    let typed: Option<#op_error_type>;
+                    let parse_error: Option<String>;
+                    #error_match_arms
+                    Err(ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error,
+                    }))
+                }
+            };
+        }
+
+        if matches!(success_body, ClientSuccessBody::Binary) {
+            return quote! {
+                let status = response.status();
+                let status_code = status.as_u16();
+                let headers = response.headers().clone();
+
+                let body_bytes = __read_bounded_response_body(
+                    response,
+                    self.max_response_body_bytes,
+                ).await?;
+                if #success_status_guard {
+                    Ok(bytes::Bytes::from(body_bytes))
+                } else {
+                    let raw_body = body_bytes;
+                    let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                    if status.is_success() {
+                        return Err(ApiOpError::Api(ApiError {
+                            status: status_code,
+                            headers,
+                            body: body_text,
+                            raw_body,
+                            typed: None,
+                            parse_error: Some(format!(
+                                "unexpected successful status {}; generated return type selects `{}`",
+                                status_code,
+                                #selected_status,
+                            )),
+                        }));
+                    }
+                    let typed: Option<#op_error_type>;
+                    let parse_error: Option<String>;
+                    #error_match_arms
+                    Err(ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error,
+                    }))
+                }
+            };
+        }
 
         quote! {
             let status = response.status();
             let status_code = status.as_u16();
             let headers = response.headers().clone();
-            let body_text = response.text().await
-                .map_err(|e| ApiOpError::Transport(HttpError::Network(e)))?;
+            let body_bytes = __read_bounded_response_body(
+                response,
+                self.max_response_body_bytes,
+            ).await?;
+            let raw_body = body_bytes;
+            let body_text = String::from_utf8_lossy(&raw_body).into_owned();
 
-            if status.is_success() {
+            if #success_status_guard {
                 #success_branch
+            } else if status.is_success() {
+                Err(ApiOpError::Api(ApiError {
+                    status: status_code,
+                    headers,
+                    body: body_text,
+                    raw_body,
+                    typed: None,
+                    parse_error: Some(format!(
+                        "unexpected successful status {}; generated return type selects `{}`",
+                        status_code,
+                        #selected_status,
+                    )),
+                }))
             } else {
                 let typed: Option<#op_error_type>;
                 let parse_error: Option<String>;
@@ -1183,6 +3172,7 @@ impl CodeGenerator {
                     status: status_code,
                     headers,
                     body: body_text,
+                    raw_body,
                     typed,
                     parse_error,
                 }))
@@ -1250,7 +3240,36 @@ impl CodeGenerator {
             .iter()
             .any(|(code, _)| !code.starts_with('2'));
 
-        let default_arm = if has_typed_enum {
+        // A spec-declared `default` response is the catch-all arm's payload
+        // type. Without this the generated enum carries a `Default(..)` variant
+        // that nothing ever constructs, so a response matched only by `default`
+        // — a perfectly parseable typed body — still surfaces as
+        // `typed: None` and callers fall back to raw strings
+        // (openapi-generator-nu7).
+        let default_payload = op
+            .response_schemas
+            .iter()
+            .find(|(code, _)| matches!(code.as_str(), "default" | "Default"))
+            .map(|(_, schema)| self.to_rust_type_name(schema));
+
+        let default_arm = if let Some(payload_ty_name) = default_payload {
+            let payload_ty = syn::Ident::new(&payload_ty_name, proc_macro2::Span::call_site());
+            let enum_ident = self.op_error_enum_ident(op);
+            quote! {
+                _ => {
+                    match serde_json::from_str::<#payload_ty>(&body_text) {
+                        Ok(v) => {
+                            typed = Some(#enum_ident::Default(v));
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+        } else if has_typed_enum {
             quote! {
                 _ => {
                     typed = None;
@@ -1377,7 +3396,7 @@ impl CodeGenerator {
     /// `rust_ident` set by the analyzer (which dedupes across the whole
     /// operation), falling back to a fresh sanitize of the wire name when
     /// no analyzer-side ident is present.
-    fn param_ident_str(&self, param: &crate::analysis::ParameterInfo) -> String {
+    pub(crate) fn param_ident_str(&self, param: &crate::analysis::ParameterInfo) -> String {
         if let Some(ident) = &param.rust_ident {
             // Apply the keyword-escape and self/super/crate dance the
             // sanitize fn does. The analyzer's base ident is already the
@@ -1420,6 +3439,11 @@ impl CodeGenerator {
         };
         let stripped = name.trim_end_matches(['<', '>', '=']);
         let mut snake_case = stripped.to_snake_case();
+        if snake_case.is_empty() {
+            snake_case.push_str("parameter");
+        } else if snake_case.starts_with(|character: char| character.is_ascii_digit()) {
+            snake_case.insert(0, '_');
+        }
         snake_case.push_str(suffix);
 
         if matches!(snake_case.as_str(), "self" | "super" | "crate" | "Self") {

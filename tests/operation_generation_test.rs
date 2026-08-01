@@ -1,5 +1,7 @@
+use openapi_to_rust::SchemaAnalyzer;
 use openapi_to_rust::analysis::{OperationInfo, RequestBodyContent, SchemaAnalysis};
 use openapi_to_rust::generator::{CodeGenerator, GeneratorConfig};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn create_test_config() -> GeneratorConfig {
@@ -27,8 +29,11 @@ fn create_test_analysis_with_operations(operations: Vec<OperationInfo>) -> Schem
             type_mappings: Default::default(),
         },
         operations: ops_map,
+        operation_responses: BTreeMap::new(),
+        operation_id_aliases: BTreeMap::new(),
         used_type_features: Default::default(),
         enum_extensions: BTreeMap::new(),
+        validation_context: Default::default(),
     }
 }
 
@@ -83,6 +88,8 @@ fn test_generate_post_operation() {
         description: None,
         request_body: Some(RequestBodyContent::Json {
             schema_name: "CreateUserRequest".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: {
             let mut map = BTreeMap::new();
@@ -114,6 +121,172 @@ fn test_generate_post_operation() {
 }
 
 #[test]
+fn schema_less_request_content_preserves_client_operation_without_a_body() {
+    let config = create_test_config();
+    let generator = CodeGenerator::new(config);
+    let operation = OperationInfo {
+        operation_id: "triggerAction".to_string(),
+        method: "POST".to_string(),
+        path: "/actions".to_string(),
+        summary: None,
+        description: None,
+        request_body: Some(RequestBodyContent::SchemaLess {
+            media_type: "application/json".to_string(),
+        }),
+        response_schemas: BTreeMap::new(),
+        parameters: vec![],
+        request_body_required: true,
+        supports_streaming: false,
+        stream_parameter: None,
+        tags: Vec::new(),
+    };
+
+    let analysis = create_test_analysis_with_operations(vec![operation]);
+    let result = generator.generate_operation_methods(&analysis).to_string();
+
+    assert!(result.contains("trigger_action (& self"), "{result}");
+    assert!(result.contains(". post (request_url)"), "{result}");
+    assert!(!result.contains("request :"), "{result}");
+    assert!(!result.contains(". body ("), "{result}");
+    assert!(
+        result.contains("reqwest :: header :: CONTENT_LENGTH , \"0\""),
+        "{result}"
+    );
+}
+
+#[test]
+fn wildcard_only_request_content_is_non_sendable_without_a_concrete_media_type() {
+    let generator = CodeGenerator::new(create_test_config());
+    let operation = OperationInfo {
+        operation_id: "uploadAnyImage".to_string(),
+        method: "POST".to_string(),
+        path: "/images".to_string(),
+        summary: None,
+        description: None,
+        request_body: Some(RequestBodyContent::Unsupported {
+            media_types: vec!["*/*".to_string(), "image/*".to_string()],
+        }),
+        response_schemas: BTreeMap::new(),
+        parameters: vec![],
+        request_body_required: true,
+        supports_streaming: false,
+        stream_parameter: None,
+        tags: Vec::new(),
+    };
+
+    let analysis = create_test_analysis_with_operations(vec![operation]);
+    let generated = generator.generate_operation_methods(&analysis).to_string();
+
+    assert!(generated.contains("body : Vec < u8 >"), "{generated}");
+    assert!(
+        generated.contains("declares only wildcard media ranges"),
+        "{generated}"
+    );
+    assert!(generated.contains("HttpError :: Config"), "{generated}");
+    assert!(!generated.contains("header (\"content-type\" , \"*/*\")"));
+    assert!(!generated.contains("header (\"content-type\" , \"image/*\")"));
+}
+
+#[test]
+fn bodyless_content_methods_emit_zero_content_length() {
+    let config = create_test_config();
+    let generator = CodeGenerator::new(config);
+
+    for method in ["POST", "PUT", "PATCH"] {
+        let operation = OperationInfo {
+            operation_id: format!("bodyless{method}"),
+            method: method.to_string(),
+            path: "/actions".to_string(),
+            summary: None,
+            description: None,
+            request_body: None,
+            response_schemas: BTreeMap::new(),
+            parameters: vec![],
+            request_body_required: false,
+            supports_streaming: false,
+            stream_parameter: None,
+            tags: Vec::new(),
+        };
+
+        let analysis = create_test_analysis_with_operations(vec![operation]);
+        let result = generator.generate_operation_methods(&analysis).to_string();
+
+        assert!(
+            result.contains("reqwest :: header :: CONTENT_LENGTH , \"0\""),
+            "expected Content-Length: 0 for {method}: {result}"
+        );
+    }
+}
+
+#[test]
+fn bodyless_methods_without_content_semantics_do_not_emit_content_length() {
+    let config = create_test_config();
+    let generator = CodeGenerator::new(config);
+
+    for method in ["GET", "HEAD", "DELETE", "OPTIONS", "TRACE"] {
+        let operation = OperationInfo {
+            operation_id: format!("bodyless{method}"),
+            method: method.to_string(),
+            path: "/actions".to_string(),
+            summary: None,
+            description: None,
+            request_body: None,
+            response_schemas: BTreeMap::new(),
+            parameters: vec![],
+            request_body_required: false,
+            supports_streaming: false,
+            stream_parameter: None,
+            tags: Vec::new(),
+        };
+
+        let analysis = create_test_analysis_with_operations(vec![operation]);
+        let result = generator.generate_operation_methods(&analysis).to_string();
+
+        assert!(
+            !result.contains("reqwest :: header :: CONTENT_LENGTH"),
+            "did not expect Content-Length for {method}: {result}"
+        );
+    }
+}
+
+#[test]
+fn optional_content_body_emits_zero_content_length_only_when_absent() {
+    let config = create_test_config();
+    let generator = CodeGenerator::new(config);
+    let operation = OperationInfo {
+        operation_id: "maybeCreateUser".to_string(),
+        method: "POST".to_string(),
+        path: "/users".to_string(),
+        summary: None,
+        description: None,
+        request_body: Some(RequestBodyContent::Json {
+            schema_name: "CreateUserRequest".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
+        }),
+        response_schemas: BTreeMap::new(),
+        parameters: vec![],
+        request_body_required: false,
+        supports_streaming: false,
+        stream_parameter: None,
+        tags: Vec::new(),
+    };
+
+    let analysis = create_test_analysis_with_operations(vec![operation]);
+    let result = generator.generate_operation_methods(&analysis).to_string();
+
+    assert!(
+        result.contains("if let Some (request) = request"),
+        "{result}"
+    );
+    assert!(result.contains("else { req = req . header"), "{result}");
+    assert!(
+        result.contains("reqwest :: header :: CONTENT_LENGTH , \"0\""),
+        "{result}"
+    );
+}
+
+#[test]
 fn test_generate_put_operation() {
     let config = create_test_config();
     let generator = CodeGenerator::new(config);
@@ -126,6 +299,8 @@ fn test_generate_put_operation() {
         description: None,
         request_body: Some(RequestBodyContent::Json {
             schema_name: "UpdateUserRequest".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: {
             let mut map = BTreeMap::new();
@@ -195,6 +370,8 @@ fn test_generate_patch_operation() {
         description: None,
         request_body: Some(RequestBodyContent::Json {
             schema_name: "PatchUserRequest".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: {
             let mut map = BTreeMap::new();
@@ -305,6 +482,8 @@ fn test_method_without_response_type() {
         description: None,
         request_body: Some(RequestBodyContent::Json {
             schema_name: "Request".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: BTreeMap::new(),
         parameters: vec![],
@@ -361,12 +540,14 @@ fn test_error_handling_generation() {
     let result = generator.generate_operation_methods(&analysis);
     let result_str = result.to_string();
 
-    // Verify error handling logic — the new envelope reads the body to a
-    // string before deserializing and wraps non-2xx (and 2xx parse failures)
+    // Verify error handling logic — the new envelope reads the body as bytes,
+    // keeps exact bytes plus a lossy string, and wraps non-2xx (and 2xx parse failures)
     // in `ApiOpError::Api(ApiError { ... })`. See issue #8.
     assert!(result_str.contains("let status = response . status ()"));
     assert!(result_str.contains("if status . is_success ()"));
-    assert!(result_str.contains("response . text ()"));
+    assert!(result_str.contains("__read_bounded_response_body"));
+    assert!(result_str.contains("String :: from_utf8_lossy"));
+    assert!(result_str.contains("raw_body"));
     assert!(result_str.contains("ApiOpError :: Api (ApiError"));
 }
 
@@ -466,6 +647,8 @@ fn test_custom_headers_injection() {
         description: None,
         request_body: Some(RequestBodyContent::Json {
             schema_name: "Request".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: BTreeMap::new(),
         parameters: vec![],
@@ -516,6 +699,8 @@ fn test_multiple_operations() {
             description: None,
             request_body: Some(RequestBodyContent::Json {
                 schema_name: "CreateUserRequest".to_string(),
+                media_type: "application/json".to_string(),
+                validation_schema: serde_json::Value::Null,
             }),
             response_schemas: {
                 let mut map = BTreeMap::new();
@@ -600,6 +785,8 @@ fn test_generate_form_urlencoded_operation() {
         description: None,
         request_body: Some(RequestBodyContent::FormUrlEncoded {
             schema_name: "TokenRequest".to_string(),
+            media_type: "application/x-www-form-urlencoded".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: {
             let mut map = BTreeMap::new();
@@ -630,28 +817,34 @@ fn test_generate_multipart_operation() {
     let config = create_test_config();
     let generator = CodeGenerator::new(config);
 
-    let operation = OperationInfo {
-        operation_id: "uploadFile".to_string(),
-        method: "POST".to_string(),
-        path: "/upload".to_string(),
-        summary: None,
-        description: None,
-        request_body: Some(RequestBodyContent::Multipart),
-        response_schemas: BTreeMap::new(),
-        parameters: vec![],
-        request_body_required: true,
-        supports_streaming: false,
-        stream_parameter: None,
-        tags: Vec::new(),
-    };
-
-    let analysis = create_test_analysis_with_operations(vec![operation]);
+    let analysis = SchemaAnalyzer::new(json!({
+        "openapi": "3.1.0",
+        "info": { "title": "multipart", "version": "1" },
+        "paths": { "/upload": { "post": {
+            "operationId": "uploadFile",
+            "requestBody": { "required": true, "content": {
+                "multipart/form-data": { "schema": {
+                    "type": "object",
+                    "required": ["file", "count"],
+                    "properties": {
+                        "file": { "type": "string", "format": "binary" },
+                        "count": { "type": "integer" },
+                        "display-name": { "type": "string" }
+                    }
+                }}
+            }},
+            "responses": { "204": { "description": "ok" } }
+        }}}
+    }))
+    .unwrap()
+    .analyze()
+    .unwrap();
     let result = generator.generate_operation_methods(&analysis);
     let result_str = result.to_string();
 
-    // Verify parameter is reqwest multipart form
-    assert!(result_str.contains("form : reqwest :: multipart :: Form"));
-    // Verify .multipart(form) call
+    assert!(result_str.contains("request : UploadFileRequest"));
+    assert!(result_str.contains("Part :: bytes"));
+    assert!(result_str.contains("\"display-name\""));
     assert!(result_str.contains(". multipart (form)"));
 }
 
@@ -666,7 +859,9 @@ fn test_generate_octet_stream_operation() {
         path: "/data".to_string(),
         summary: None,
         description: None,
-        request_body: Some(RequestBodyContent::OctetStream),
+        request_body: Some(RequestBodyContent::OctetStream {
+            media_type: "application/octet-stream; profile=v2".to_string(),
+        }),
         response_schemas: BTreeMap::new(),
         parameters: vec![],
         request_body_required: true,
@@ -684,7 +879,7 @@ fn test_generate_octet_stream_operation() {
     // Verify body is used directly
     assert!(result_str.contains(". body (body)"));
     // Verify content-type header
-    assert!(result_str.contains("application/octet-stream"));
+    assert!(result_str.contains("application/octet-stream; profile=v2"));
 }
 
 #[test]
@@ -698,7 +893,9 @@ fn test_generate_text_plain_operation() {
         path: "/echo".to_string(),
         summary: None,
         description: None,
-        request_body: Some(RequestBodyContent::TextPlain),
+        request_body: Some(RequestBodyContent::TextPlain {
+            media_type: "text/plain; charset=utf-8".to_string(),
+        }),
         response_schemas: BTreeMap::new(),
         parameters: vec![],
         request_body_required: true,
@@ -716,7 +913,7 @@ fn test_generate_text_plain_operation() {
     // Verify body is used directly
     assert!(result_str.contains(". body (body)"));
     // Verify content-type header
-    assert!(result_str.contains("text/plain"));
+    assert!(result_str.contains("text/plain; charset=utf-8"));
 }
 
 #[test]
@@ -737,6 +934,8 @@ fn test_request_body_schema_name_pascal_cased() {
         description: None,
         request_body: Some(RequestBodyContent::Json {
             schema_name: "update_api_key".to_string(),
+            media_type: "application/json".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: BTreeMap::new(),
         parameters: vec![],
@@ -754,6 +953,8 @@ fn test_request_body_schema_name_pascal_cased() {
         description: None,
         request_body: Some(RequestBodyContent::FormUrlEncoded {
             schema_name: "create_oauth_token".to_string(),
+            media_type: "application/x-www-form-urlencoded".to_string(),
+            validation_schema: serde_json::Value::Null,
         }),
         response_schemas: BTreeMap::new(),
         parameters: vec![],

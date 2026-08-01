@@ -15,9 +15,9 @@
 //!   [`SchemaType::Primitive`](crate::analysis::SchemaType::Primitive)
 //!   to the field-emission site in `generator.rs`, which wraps them
 //!   in a `#[serde(with = …)]` attribute.
-//! - [`UsedFeatures`] tracks which optional crates the mapper
-//!   actually emitted references to. Q2.8 combines this with
-//!   mode-specific dependencies and writes a `REQUIRED_DEPS.toml`.
+//! - [`UsedFeatures`] records typed-scalar crate usage for helper emission and
+//!   compatibility APIs. The complete generated dependency manifest is
+//!   collected from the exact emitted files after operation/model pruning.
 //!
 //! # Conservative mode
 //! Pass `TypeMappingConfig::conservative()` (CLI: `--types-conservative`)
@@ -41,8 +41,7 @@ pub struct MappedType {
     /// Optional `#[serde(with = "...")]` codec path. The generator
     /// wraps this in a `with = "<value>"` field attribute.
     pub serde_with: Option<String>,
-    /// Optional crate this mapping introduced. Tracked in
-    /// [`UsedFeatures`] for the dep advisory (Q2.8).
+    /// Optional crate this mapping introduced, tracked in [`UsedFeatures`].
     pub feature: Option<TypeFeature>,
 }
 
@@ -87,6 +86,13 @@ impl MappedType {
 pub enum TypeFeature {
     Chrono,
     Time,
+    /// `time::Date` via the generated `time_date_format` codec.
+    /// Tracked separately from [`TypeFeature::Time`] so the
+    /// generator only emits the `time::serde::format_description!`
+    /// helper when a `format: date` field actually exists.
+    TimeDate,
+    /// `time::Time` via the generated `time_time_format` codec.
+    TimeTime,
     Iso8601,
     Uuid,
     Bytes,
@@ -96,15 +102,28 @@ pub enum TypeFeature {
 }
 
 impl TypeFeature {
-    /// Canonical dependency line for this feature. Q2.8 uses this to
-    /// emit `REQUIRED_DEPS.toml` next to the generated code so users
-    /// know exactly which crates to add to their Cargo.toml.
+    /// Canonical dependency requirement for this typed scalar.
     pub fn dep_requirement(self) -> DepRequirement {
         match self {
             Self::Chrono => DepRequirement::new("chrono", "0.4").with_features(&["serde"]),
-            Self::Time => DepRequirement::new("time", "0.3").with_features(&["serde"]),
-            Self::Iso8601 => DepRequirement::new("iso8601", "0.6"),
-            Self::Uuid => DepRequirement::new("uuid", "1").with_features(&["serde", "v4"]),
+            // `serde` alone doesn't enable `time::serde::rfc3339`;
+            // the codec modules are gated on formatting/parsing.
+            Self::Time => DepRequirement::new("time", "0.3").with_features(&[
+                "serde",
+                "formatting",
+                "parsing",
+            ]),
+            // `macros` on top: Date/Time have no built-in serde
+            // codec, so the generated code declares one via
+            // `time::serde::format_description!`.
+            Self::TimeDate | Self::TimeTime => DepRequirement::new("time", "0.3").with_features(&[
+                "serde",
+                "formatting",
+                "parsing",
+                "macros",
+            ]),
+            Self::Iso8601 => DepRequirement::new("iso8601", "0.6").with_features(&["serde"]),
+            Self::Uuid => DepRequirement::new("uuid", "1").with_features(&["serde"]),
             Self::Bytes => DepRequirement::new("bytes", "1").with_features(&["serde"]),
             Self::Base64 => DepRequirement::new("base64", "0.22"),
             Self::Url => DepRequirement::new("url", "2").with_features(&["serde"]),
@@ -119,6 +138,8 @@ pub struct DepRequirement {
     pub crate_name: &'static str,
     pub version: &'static str,
     pub features: Vec<&'static str>,
+    pub default_features: bool,
+    pub optional: bool,
 }
 
 impl DepRequirement {
@@ -127,18 +148,32 @@ impl DepRequirement {
             crate_name,
             version,
             features: Vec::new(),
+            default_features: true,
+            optional: false,
         }
     }
 
     pub fn with_features(mut self, features: &[&'static str]) -> Self {
         self.features = features.to_vec();
+        self.features.sort_unstable();
+        self.features.dedup();
+        self
+    }
+
+    pub fn without_default_features(mut self) -> Self {
+        self.default_features = false;
+        self
+    }
+
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
         self
     }
 
     /// Render as a single TOML `[dependencies]` line. Picks the
     /// most compact form that still expresses the required features.
     pub fn to_toml_line(&self) -> String {
-        if self.features.is_empty() {
+        if self.features.is_empty() && self.default_features && !self.optional {
             format!("{} = \"{}\"", self.crate_name, self.version)
         } else {
             let feats = self
@@ -147,17 +182,25 @@ impl DepRequirement {
                 .map(|f| format!("\"{f}\""))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "{} = {{ version = \"{}\", features = [{}] }}",
-                self.crate_name, self.version, feats
-            )
+            let mut attributes = vec![format!("version = \"{}\"", self.version)];
+            if !self.default_features {
+                attributes.push("default-features = false".to_string());
+            }
+            if !self.features.is_empty() {
+                attributes.push(format!("features = [{feats}]"));
+            }
+            if self.optional {
+                attributes.push("optional = true".to_string());
+            }
+            format!("{} = {{ {} }}", self.crate_name, attributes.join(", "))
         }
     }
 }
 
 /// Render `REQUIRED_DEPS.toml` content from a sorted set of
 /// requirements. Returns `None` when the input is empty so the
-/// caller can skip writing the file.
+/// caller can skip writing the file when no generated Rust files need
+/// external crates.
 pub fn render_required_deps_toml(deps: &[DepRequirement]) -> Option<String> {
     if deps.is_empty() {
         return None;
@@ -165,13 +208,9 @@ pub fn render_required_deps_toml(deps: &[DepRequirement]) -> Option<String> {
     let mut out = String::new();
     out.push_str(
         "# Generated by openapi-to-rust.\n\
-         # These crates are required by the generated code. Copy these\n\
-         # lines into the [dependencies] section of your consuming\n\
-         # crate's Cargo.toml.\n\
-         #\n\
-         # Typed-scalar deps can be avoided by setting the relevant\n\
-         # strategies to \"string\" in [generator.types], or by passing\n\
-         # --types-conservative on the CLI.\n\
+         # Complete direct dependencies for this generated output.\n\
+         # Append this fragment to the consuming crate's Cargo.toml, or\n\
+         # merge it with existing dependency and feature sections.\n\
          \n\
          [dependencies]\n",
     );
@@ -179,17 +218,228 @@ pub fn render_required_deps_toml(deps: &[DepRequirement]) -> Option<String> {
         out.push_str(&dep.to_toml_line());
         out.push('\n');
     }
+    if deps.iter().any(|dep| dep.crate_name == "specta") {
+        out.push_str("\n[features]\nspecta = [\"dep:specta\"]\n");
+    }
     Some(out)
+}
+
+/// Merge requirements by crate name, unioning features deterministically.
+/// A dependency is optional only when every occurrence is optional, and
+/// default features are enabled when any occurrence needs them.
+pub fn merge_dep_requirements(
+    requirements: impl IntoIterator<Item = DepRequirement>,
+) -> Vec<DepRequirement> {
+    let mut merged: std::collections::BTreeMap<&'static str, DepRequirement> =
+        std::collections::BTreeMap::new();
+    for mut dependency in requirements {
+        dependency.features.sort_unstable();
+        dependency.features.dedup();
+        match merged.get_mut(dependency.crate_name) {
+            Some(existing) => {
+                debug_assert_eq!(existing.version, dependency.version);
+                existing.default_features |= dependency.default_features;
+                existing.optional &= dependency.optional;
+                existing.features.extend(dependency.features);
+                existing.features.sort_unstable();
+                existing.features.dedup();
+            }
+            None => {
+                merged.insert(dependency.crate_name, dependency);
+            }
+        }
+    }
+    merged.into_values().collect()
+}
+
+/// Collect the complete direct dependency set from the exact Rust files that
+/// will be written. Scanning emitted paths keeps model pruning and operation
+/// selection authoritative: dependencies cannot leak in from schemas or
+/// operations that were analyzed but not generated.
+pub fn collect_generated_dep_requirements<'a>(
+    contents: impl IntoIterator<Item = &'a str>,
+    enable_specta: bool,
+) -> Vec<DepRequirement> {
+    let generated = contents.into_iter().collect::<Vec<_>>().join("\n");
+    let mut dependencies = Vec::new();
+    let uses = |needle: &str| generated.contains(needle);
+
+    if uses("serde::") {
+        dependencies.push(DepRequirement::new("serde", "1").with_features(&["derive"]));
+    }
+    if uses("serde_json::") {
+        dependencies.push(DepRequirement::new("serde_json", "1"));
+    }
+    if uses("serde_urlencoded::") {
+        dependencies.push(DepRequirement::new("serde_urlencoded", "0.7"));
+    }
+    if uses("chrono::") {
+        dependencies.push(TypeFeature::Chrono.dep_requirement());
+    }
+    let uses_time = uses("time::OffsetDateTime") || uses("time::Date") || uses("time::Time");
+    if uses_time {
+        let feature = if uses("time::Date") || uses("time::Time") {
+            TypeFeature::TimeDate
+        } else {
+            TypeFeature::Time
+        };
+        dependencies.push(feature.dep_requirement());
+    }
+    if uses("iso8601::") {
+        dependencies.push(TypeFeature::Iso8601.dep_requirement());
+    }
+    if uses("uuid::") {
+        dependencies.push(TypeFeature::Uuid.dep_requirement());
+    }
+    if uses("bytes::") {
+        dependencies.push(TypeFeature::Bytes.dep_requirement());
+    }
+    if uses("base64::") {
+        dependencies.push(TypeFeature::Base64.dep_requirement());
+    }
+    if uses("url::") {
+        let dependency = if uses("url::Url") {
+            TypeFeature::Url.dep_requirement()
+        } else {
+            DepRequirement::new("url", "2")
+        };
+        dependencies.push(dependency);
+    }
+    if uses("email_address::") {
+        dependencies.push(TypeFeature::EmailAddress.dep_requirement());
+    }
+
+    if uses("reqwest::") {
+        let mut features = vec!["rustls"];
+        if uses(".json(&") {
+            features.push("json");
+        }
+        if uses(".query(&") {
+            features.push("query");
+        }
+        if uses(".form(&") {
+            features.push("form");
+        }
+        // Multipart operations reference `reqwest::multipart::Form` directly.
+        // reqwest is pinned with default-features off, so the feature has to be
+        // requested explicitly or the generated client fails to compile with
+        // "cannot find `multipart` in `reqwest`". The reqwest-middleware side
+        // of this was already handled below; reqwest itself was missed
+        // (openapi-generator-upz). Hits any spec with a file upload.
+        if uses("reqwest::multipart") {
+            features.push("multipart");
+        }
+        // Incremental response streaming APIs used by generated SSE operations
+        // are gated behind reqwest's `stream` feature.
+        if uses(".bytes_stream()") || uses(".chunk().await") {
+            features.push("stream");
+        }
+        dependencies.push(
+            DepRequirement::new("reqwest", "0.13")
+                .without_default_features()
+                .with_features(&features),
+        );
+    }
+    if uses("reqwest_middleware::") {
+        let mut features = Vec::new();
+        if uses(".json(&") {
+            features.push("json");
+        }
+        if uses(".query(&") {
+            features.push("query");
+        }
+        if uses(".form(&") {
+            features.push("form");
+        }
+        if uses(".multipart(form)") {
+            features.push("multipart");
+        }
+        dependencies
+            .push(DepRequirement::new("reqwest-middleware", "0.5").with_features(&features));
+    }
+    if uses("reqwest_retry::") {
+        let dependency = DepRequirement::new("reqwest-retry", "0.9");
+        dependencies.push(if uses("reqwest_tracing::") {
+            dependency
+        } else {
+            dependency.without_default_features()
+        });
+    }
+    if uses("reqwest_tracing::") {
+        dependencies.push(DepRequirement::new("reqwest-tracing", "0.7"));
+    }
+    if uses("thiserror::") || uses("use thiserror::") {
+        dependencies.push(DepRequirement::new("thiserror", "2"));
+    }
+    if uses("async_trait::") {
+        dependencies.push(DepRequirement::new("async-trait", "0.1"));
+    }
+    if uses("futures_util::") {
+        dependencies.push(DepRequirement::new("futures-util", "0.3"));
+    }
+    if uses("futures_timer::") {
+        dependencies.push(DepRequirement::new("futures-timer", "3"));
+    }
+    if uses("futures_core::") {
+        dependencies.push(DepRequirement::new("futures-core", "0.3"));
+    }
+    if uses("use tracing::") {
+        dependencies.push(DepRequirement::new("tracing", "0.1"));
+    }
+    if uses("axum::") {
+        let mut features = vec!["json"];
+        if uses("axum::extract::Multipart") {
+            features.push("multipart");
+        }
+        if uses("axum::response::sse::") {
+            features.push("tokio");
+        }
+        dependencies.push(
+            DepRequirement::new("axum", "0.8")
+                .without_default_features()
+                .with_features(&features),
+        );
+    }
+    if uses("jsonschema::") {
+        dependencies.push(DepRequirement::new("jsonschema", "0.49").without_default_features());
+    }
+    if uses("http_body_util::") {
+        dependencies.push(DepRequirement::new("http-body-util", "0.1"));
+    }
+    if uses("mime::") {
+        dependencies.push(DepRequirement::new("mime", "0.3"));
+    }
+    if enable_specta {
+        let mut features = vec!["derive"];
+        for (needle, feature) in [
+            ("bytes::", "bytes"),
+            ("chrono::", "chrono"),
+            ("time::OffsetDateTime", "time"),
+            ("url::Url", "url"),
+            ("uuid::", "uuid"),
+        ] {
+            if uses(needle) {
+                features.push(feature);
+            }
+        }
+        if uses_time {
+            features.push("time");
+        }
+        dependencies.push(
+            DepRequirement::new("specta", "2.0.0-rc.25")
+                .with_features(&features)
+                .optional(),
+        );
+    }
+
+    merge_dep_requirements(dependencies)
 }
 
 /// Snapshot a `UsedFeatures` set as a sorted, de-duplicated list of
 /// `DepRequirement`s. Sorting by crate name keeps the emitted file
 /// deterministic so it can be checked in or diffed.
 pub fn collect_dep_requirements(used: &UsedFeatures) -> Vec<DepRequirement> {
-    let mut deps: Vec<DepRequirement> = used.iter().map(|f| f.dep_requirement()).collect();
-    deps.sort_by_key(|d| d.crate_name);
-    deps.dedup_by_key(|d| d.crate_name);
-    deps
+    merge_dep_requirements(used.iter().map(|feature| feature.dep_requirement()))
 }
 
 /// Tracks which optional crates the generator emitted code for.
@@ -268,9 +518,13 @@ pub enum UuidStrategy {
 pub enum ByteStrategy {
     String,
     /// `Vec<u8>` round-tripped via an inlined `base64_serde` module
-    /// (default).
+    /// using the standard padded alphabet (default).
     #[default]
     Base64,
+    /// `Vec<u8>` round-tripped with the URL-safe, unpadded alphabet
+    /// from RFC 7515 section 2. This setting applies to every
+    /// `format: byte` field in the generated module.
+    Base64UrlUnpadded,
     /// `Vec<u8>` with no codec (caller responsible for encoding).
     VecU8,
 }
@@ -327,7 +581,7 @@ pub enum EmailStrategy {
 /// TOML section. Defaults flip on every common typed scalar; opt out
 /// per format by setting the strategy to `string` in TOML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, rename_all = "snake_case")]
+#[serde(default, rename_all = "snake_case", deny_unknown_fields)]
 pub struct TypeMappingConfig {
     pub date_time: DateStrategy,
     pub date: DateStrategy,
@@ -363,6 +617,26 @@ pub struct TypeMappingConfig {
 
     /// Vendor-extension toggles for enums. Filled in by Q2.6.
     pub enums: Option<TypeEnumsConfig>,
+
+    /// Rust type for `format: float`. Defaults to `f64`, which round-trips the
+    /// JSON number the server actually sent; `f32` maps strictly by declared
+    /// format at the cost of precision.
+    #[serde(default)]
+    pub float_precision: FloatPrecision,
+}
+
+/// How `format: float` is mapped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FloatPrecision {
+    /// Map to `f64` (default). JSON carries no binary32, so widening preserves
+    /// the transmitted value exactly.
+    #[default]
+    F64,
+    /// Map to `f32`, matching the declared format literally. Values that are
+    /// not representable in binary32 lose precision — `0.03` becomes
+    /// `0.029999999329447746`.
+    F32,
 }
 
 fn default_true() -> bool {
@@ -372,6 +646,7 @@ fn default_true() -> bool {
 impl Default for TypeMappingConfig {
     fn default() -> Self {
         Self {
+            float_precision: FloatPrecision::default(),
             date_time: DateStrategy::default(),
             date: DateStrategy::default(),
             time: DateStrategy::default(),
@@ -445,6 +720,9 @@ impl TypeMappingConfig {
     /// by typed-scalar adoption.
     pub fn conservative() -> Self {
         Self {
+            // Conservative mode reproduces pre-Q2 output, which mapped
+            // `format: float` literally to `f32`.
+            float_precision: FloatPrecision::F32,
             date_time: DateStrategy::String,
             date: DateStrategy::String,
             time: DateStrategy::String,
@@ -466,7 +744,7 @@ impl TypeMappingConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "snake_case")]
+#[serde(default, rename_all = "snake_case", deny_unknown_fields)]
 pub struct TypeShapeConfig {
     pub additional_properties_typed: Option<bool>,
     pub unique_items_to_set: Option<bool>,
@@ -474,7 +752,7 @@ pub struct TypeShapeConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "snake_case")]
+#[serde(default, rename_all = "snake_case", deny_unknown_fields)]
 pub struct TypeConstraintsConfig {
     /// Q2.4 constraint annotation mode. Defaults to `Doc` when the
     /// `[generator.types.constraints]` block is absent (see
@@ -502,7 +780,7 @@ pub enum ConstraintMode {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "snake_case")]
+#[serde(default, rename_all = "snake_case", deny_unknown_fields)]
 pub struct TypeEnumsConfig {
     pub x_enum_varnames: Option<bool>,
     pub x_enum_descriptions: Option<bool>,
@@ -531,8 +809,7 @@ impl TypeMapper {
         }
     }
 
-    /// Snapshot of crates this mapper has emitted references to.
-    /// Read after generation by Q2.8 to write `REQUIRED_DEPS.toml`.
+    /// Snapshot of typed-scalar crates this mapper has referenced.
     pub fn used_features(&self) -> UsedFeatures {
         self.used.borrow().clone()
     }
@@ -654,8 +931,12 @@ impl TypeMapper {
                 MappedType::with_feature("chrono::NaiveDate", TypeFeature::Chrono)
             }
             DateStrategy::Time => {
-                self.record(TypeFeature::Time);
-                MappedType::with_codec("time::Date", "time::serde::iso8601", TypeFeature::Time)
+                self.record(TypeFeature::TimeDate);
+                // `time::serde::iso8601` only supports
+                // OffsetDateTime; `time_date_format` is a codec
+                // module the generator emits into the file via
+                // `time::serde::format_description!` (GH #25).
+                MappedType::with_codec("time::Date", "time_date_format", TypeFeature::TimeDate)
             }
         }
     }
@@ -668,8 +949,10 @@ impl TypeMapper {
                 MappedType::with_feature("chrono::NaiveTime", TypeFeature::Chrono)
             }
             DateStrategy::Time => {
-                self.record(TypeFeature::Time);
-                MappedType::with_codec("time::Time", "time::serde::iso8601", TypeFeature::Time)
+                self.record(TypeFeature::TimeTime);
+                // Same story as `time::Date`: no built-in codec, so
+                // the generator emits `time_time_format`.
+                MappedType::with_codec("time::Time", "time_time_format", TypeFeature::TimeTime)
             }
         }
     }
@@ -707,11 +990,12 @@ impl TypeMapper {
         match strat {
             ByteStrategy::String => MappedType::plain("String"),
             ByteStrategy::VecU8 => MappedType::plain("Vec<u8>"),
-            ByteStrategy::Base64 => {
+            ByteStrategy::Base64 | ByteStrategy::Base64UrlUnpadded => {
                 self.record(TypeFeature::Base64);
                 // Path is resolved relative to the generated
                 // module; the helper module is emitted as
-                // `base64_serde` at the top of `types.rs`.
+                // `base64_serde` at the top of `types.rs`. Its
+                // alphabet is selected once during code generation.
                 MappedType::with_codec("Vec<u8>", "base64_serde", TypeFeature::Base64)
             }
         }
@@ -783,10 +1067,25 @@ impl TypeMapper {
         }
     }
 
+    /// Map `number` + optional `format` → Rust type.
+    ///
+    /// `format: float` maps to `f64` by default rather than `f32`. JSON has no
+    /// binary32: a value written on the wire as `0.03` parses losslessly into
+    /// `f64`, but through `f32` it becomes `0.029999999329447746`. The declared
+    /// format describes the server's internal storage, not the transport, so
+    /// `f32` discards precision the response actually carried. Observed live on
+    /// RunPod's catalog prices, which declare `float` while the billing
+    /// endpoints declare `double`.
+    ///
+    /// Set `float_precision = "f32"` under `[generator.types]` to map strictly
+    /// by declared format instead.
     pub fn number_format(&self, format: Option<&str>) -> MappedType {
         let normalized = self.normalize_format(format);
         match normalized.as_deref() {
-            Some("float") => MappedType::plain("f32"),
+            Some("float") if self.config.float_precision == FloatPrecision::F32 => {
+                MappedType::plain("f32")
+            }
+            Some("float") => MappedType::plain("f64"),
             Some("double") => MappedType::plain("f64"),
             _ => MappedType::plain("f64"),
         }
@@ -824,7 +1123,6 @@ impl TypeMapper {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -874,6 +1172,25 @@ mod tests {
     }
 
     #[test]
+    fn byte_url_unpadded_reuses_base64_codec() {
+        let mapper = TypeMapper::new(TypeMappingConfig {
+            byte: ByteStrategy::Base64UrlUnpadded,
+            ..TypeMappingConfig::default()
+        });
+        let mapped = mapper.string_format(Some("byte"));
+        assert_eq!(mapped.rust_type, "Vec<u8>");
+        assert_eq!(mapped.serde_with.as_deref(), Some("base64_serde"));
+        assert_eq!(mapped.feature, Some(TypeFeature::Base64));
+    }
+
+    #[test]
+    fn byte_url_unpadded_parses_from_toml() {
+        let config: TypeMappingConfig =
+            toml::from_str(r#"byte = "base64_url_unpadded""#).expect("parse type config");
+        assert_eq!(config.byte, ByteStrategy::Base64UrlUnpadded);
+    }
+
+    #[test]
     fn conservative_config_collapses_everything_to_string() {
         let m = TypeMapper::new(TypeMappingConfig::conservative());
         for fmt in [
@@ -920,10 +1237,8 @@ mod tests {
 
     #[test]
     fn unsigned_off_degrades_uint_to_i64() {
-        let cfg = TypeMappingConfig {
-            unsigned: false,
-            ..Default::default()
-        };
+        let mut cfg = TypeMappingConfig::default();
+        cfg.unsigned = false;
         let m = TypeMapper::new(cfg);
         assert_eq!(m.integer_format(Some("uint32")).rust_type, "i64");
         assert_eq!(m.integer_format(Some("uint64")).rust_type, "i64");

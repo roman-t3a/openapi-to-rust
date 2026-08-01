@@ -1,54 +1,113 @@
-# openapi-to-rust
+# openapi-to-rust — OpenAPI generator for Rust
 
 [![CI](https://github.com/gpu-cli/openapi-to-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/gpu-cli/openapi-to-rust/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/openapi-to-rust.svg)](https://crates.io/crates/openapi-to-rust)
 [![docs.rs](https://docs.rs/openapi-to-rust/badge.svg)](https://docs.rs/openapi-to-rust)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A Rust code generator that turns OpenAPI 3.1 (and 3.2-experimental) specifications into strongly-typed structs, async HTTP clients, SSE streaming clients, **and opt-in Axum server scaffolding** — including for the messy, real-world specs everyone actually ships.
+`openapi-to-rust` is an OpenAPI generator for Rust that turns OpenAPI 3.0/3.1 (and experimental 3.2) specifications into strongly-typed structs, async HTTP clients, SSE streaming clients, **and opt-in Axum server scaffolding** — including for the messy, real-world specs everyone actually ships.
+
+Read the [guides and documentation](https://openapi-to-rust.dev/) for the quickest path from an OpenAPI document to compiling Rust.
+
+## 5-second trial
+
+Paste your spec into the **[browser playground](https://openapi-to-rust.dev/playground)** —
+the real generator compiled to WebAssembly. See the generated Rust instantly and
+download it as a complete, compilable crate. Nothing is uploaded.
+
+## 30-second trial
+
+Install the CLI from crates.io, then generate a tiny client from a stable,
+hosted fixture:
+
+```bash
+cargo install --locked openapi-to-rust
+openapi-to-rust generate https://raw.githubusercontent.com/gpu-cli/openapi-to-rust/v0.8.0/tests/fixtures/operation_extraction/simple_get.json
+```
+
+This writes `src/generated/{types,client,mod}.rs` and the exact dependencies
+needed to compile them in `src/generated/REQUIRED_DEPS.toml`. Use `--dry-run`
+to inspect the plan without writing, and `--check` in CI to detect stale
+committed output.
 
 We originally built this internally at [GPU CLI](https://gpu-cli.sh) to generate typed Rust clients for OpenAI, Anthropic, Cloudflare, and other large APIs. After battle-testing it against real-world specs with complex union types, discriminated enums, streaming endpoints, and the occasional spec/API drift, we decided to open source it.
 
-It currently compiles cleanly against **54 real-world specs** in `specs/` (Stripe, OpenAI, Anthropic, Cloudflare's 14k-schema spec, GitHub, Discord, Microsoft Graph, Spotify, Twilio, …), guarded by CI.
+The repository contains **56 real-world specs**. The supported OpenAPI corpus is
+55 specs (one Gitea document is Swagger 2.0 and intentionally skipped). Pull
+requests compile-check the OpenAI and Anthropic production specs. The full tier
+generates all 55 and compile-checks 54; Microsoft Graph is generate-only in CI
+because its generated crate exceeds runner memory, and can be force-checked on
+a larger local machine.
 
-## What's new in 0.5
-
-- **Server codegen (Axum)** — opt-in `[server]` section emits a trait per tag, a status-code-typed response enum (with `IntoResponse`), an SSE-aware variant, and a `Router` factory. Pick operations one-by-one or `--all-tag`. Two end-to-end examples ship in `examples/server-{openai-responses,anthropic-messages}/`.
-- **OpenAPI 3.1 + 3.2 conformance** — strict spec-extension parsing (typed `Extensions` newtype rejects unknown non-`x-` keys), full Components family (`Server`/`SecurityScheme`/`Header`/`Example`/`Link`/`Callback`/`Tag`/`ExternalDocs`/`Encoding`), JSON Schema 2020-12 keywords (`prefixItems`, `patternProperties`, `propertyNames`, `unevaluatedItems`/`Properties`, `dependentRequired`/`Schemas`, `contains`/`min`/`maxContains`, `contentEncoding`/`MediaType`/`Schema`, `if`/`then`/`else`, `$dynamicRef`/`$dynamicAnchor`, `$defs`), and 3.2 deltas (`query` HTTP method, `additionalOperations`, OAuth `deviceAuthorization`, `Server.name`, `Tag.parent`/`kind`/`summary`, `Discriminator.defaultMapping`, `mediaTypes` components, item-level encoding).
-- **Real-world spec compile guarantee** — fixed a long tail of generator bugs surfaced by 54 specs in CI (`r#self` panics, operationId collisions, exclusiveMinimum bool-vs-number, signed enum variants, `<`/`>` Twilio param sanitization, self-referential union sizing, $ref-typed params, optional request bodies, and more). The full corpus runs locally; CI gates on the gold list.
-- **Codegen quality fixes** — header params wired through the signature, HEAD/OPTIONS/PATCH/TRACE methods emitted, $ref-typed parameters resolved to their referenced enum types, path-templating percent-encoded per RFC 3986, range status codes (`2XX`/`4XX`/`5XX`) matched correctly, auth scheme (`Bearer`/`ApiKey`/`Custom`) honored at runtime, optional request bodies wrapped in `Option<T>`, operationId collisions detected loudly.
-- **Webhook ingest** — operations declared under top-level `webhooks:` flow through analysis like any other operation.
-- **SSE auto-detect** — responses with `text/event-stream` automatically mark the operation as streaming; the streaming config still wins when present.
-
-See the [full release notes](#release-notes) at the bottom of this README for the per-area breakdown.
+Release history and breaking changes live in the [changelog](CHANGELOG.md).
 
 ## Highlights
 
-- **OpenAPI 3.1 first, 3.2 experimental** — handles `type: ["X", "null"]`, `anyOf`/`oneOf`/`allOf`, discriminated unions, `const`, inline objects, and accepts paths-less specs (components-only or webhooks-only).
-- **Generates clients *and* servers** — pick what you want via `[features]` and `[server]`. Both share the same `types.rs`.
+- **OpenAPI 3.0 and 3.1, with experimental 3.2 support** — handles `type: ["X", "null"]`, `anyOf`/`oneOf`/`allOf`, discriminated unions, `const`, inline objects, and accepts paths-less specs (components-only or webhooks-only).
+- **Generates clients *and* servers** — pick client calls with `[client]`, hosted operations with `[server]`, or keep the default all-operation client. Both share the same `types.rs`.
 - **Typed scalars** — `format: date-time` → `chrono::DateTime<chrono::Utc>`, `uri` → `url::Url`, `binary` → `bytes::Bytes`, `uuid` → `uuid::Uuid`, `byte` → `Vec<u8>` + base64 codec, unsigned-int formats → `u32`/`u64`. All opt-out per-format in TOML.
-- **Async HTTP client** — typed methods per operation, retry/backoff via `reqwest-retry`, distributed tracing via `reqwest-tracing`, Bearer / API-key / custom auth (honored at runtime), default headers, path-template percent-encoding.
-- **Axum server scaffolding** — trait per tag, status-code-typed response enum, SSE-ready `OkStream` variant, required-param HTTP 400 short-circuit at the handler boundary, combined `build_router(...)` factory for multi-tag selections.
-- **SSE streaming clients** — first-class Server-Sent Events with reconnection.
+- **Async HTTP client** — typed JSON, text, binary, and multipart operations; bounded responses; retry/backoff via `reqwest-retry`; distributed tracing via `reqwest-tracing`; Bearer / API-key / custom auth; default headers; path-template percent-encoding.
+- **Axum 0.8 server scaffolding** — trait per tag, status-code-typed response enum, typed multipart/raw bodies, SSE-ready `OkStream` variant, OpenAPI request validation, and a combined `build_router(...)` factory for multi-tag selections.
+- **SSE streaming clients** — raw or typed Server-Sent Events, preserved event metadata, bounded error bodies, reconnect backoff, server `retry:` support, and `Last-Event-ID` resumption.
 - **Smart discriminated unions** — auto-detects implicit discriminators from `const` properties, falls back to `#[serde(untagged)]` when a union mixes scalar and object branches (e.g. `"auto"` *or* a tagged object).
 - **Per-operation typed errors** — each operation gets its own error enum with `Status4xx(...)` typed bodies; you can match on the exact API error shape.
 - **Typed `additionalProperties`** — extra keys become `BTreeMap<String, T>` instead of falling to `serde_json::Value` when the spec gives a value-type schema.
-- **Constraint-as-doc** — `minLength`/`maxLength`/`minimum`/`pattern` etc. are emitted as `/// Constraint: …` doc comments. **No runtime validation is added**, so generated code stays free of validator-crate dependencies.
+- **Constraints at the server boundary** — `minLength`/`maxLength`/`minimum`/`pattern` remain useful model documentation, and selected Axum operations validate their request schemas at runtime with an offline `jsonschema` bundle.
 - **TOML configuration** with overrides for spec quirks (nullable, extensible enums, type aliases).
 - **Snapshot testing** — `insta` snapshots for generated output.
 - **Optional `specta::Type` derives** for cross-language type sharing.
 
+## Compared with Progenitor
+
+[Progenitor](https://github.com/oxidecomputer/progenitor) is an established,
+opinionated OpenAPI 3.0.x client generator developed by Oxide, with particular
+alignment to Dropshot-generated APIs. It supports procedural-macro,
+build-script, and static-crate workflows, plus pagination streams, generated
+CLI support, and typed mocking helpers.
+
+openapi-to-rust grew around consuming large third-party specifications. Its
+focus includes OpenAPI 3.1 schema forms, ahead-of-time generated source,
+selected Reqwest client operations, SSE, and Axum server scaffolding with shared
+models. In one reproducible 120-operation benchmark, its normal ahead-of-time
+workflow had 26.5% lower median clean `cargo check` wall time; no-op builds were
+effectively identical. This is a version- and machine-specific observation, not
+a universal performance guarantee.
+
+See the [dated, source-linked Progenitor comparison](https://openapi-to-rust.dev/compare/progenitor)
+and the [benchmark methodology](benchmarks/progenitor-builds/README.md) for the
+relevant tradeoffs and limitations.
+
 ## Install
 
-```toml
-[dependencies]
-openapi-to-rust = "0.5"
-```
-
-Or as a CLI:
+Rust users with Rust 1.88 or newer can install the CLI from crates.io:
 
 ```bash
-cargo install openapi-to-rust
+cargo install --locked openapi-to-rust
+```
+
+This compiles the CLI locally and requires a Rust toolchain. Prebuilt binaries
+are not currently published. If you use the generator as a Rust library instead,
+run `cargo add openapi-to-rust`.
+
+## Try it in one command
+
+Generate types and an async client directly from a local document or HTTPS URL:
+
+```bash
+openapi-to-rust generate openapi.yaml
+# Writes src/generated/{types,client,mod}.rs and REQUIRED_DEPS.toml.
+```
+
+The async client is the default. Use `--types-only` to omit it, `--dry-run` to
+analyze without writing, or `--check` in CI to fail when committed output is
+stale. Remote fetches require HTTPS (except loopback development), reject URL
+credentials and redirects, and enforce time and response-size limits.
+
+To keep a reusable config:
+
+```bash
+openapi-to-rust init openapi.yaml
+openapi-to-rust generate
 ```
 
 ## Quick start — client
@@ -60,6 +119,12 @@ cargo install openapi-to-rust
 spec_path = "openapi.json"
 output_dir = "src/generated"
 module_name = "api"
+# All paths above are relative to this TOML file, not the shell's working directory.
+
+[generator.builders]
+# Add `*_builder()` when an operation has more than three optional values.
+enabled = true
+threshold = 3
 
 [features]
 enable_async_client = true
@@ -67,6 +132,7 @@ enable_async_client = true
 [http_client]
 base_url = "https://api.example.com"
 timeout_seconds = 30
+max_response_body_bytes = 8388608
 
 [http_client.retry]
 max_retries = 3
@@ -81,6 +147,24 @@ Then:
 ```bash
 openapi-to-rust generate --config openapi-to-rust.toml
 ```
+
+### Select only the client operations you use
+
+`[client]` is optional. Without it—or with an empty `operations` list—the HTTP client keeps every operation for backward compatibility. Selectors share the server grammar: exact `operationId`, exact `METHOD /path`, or `tag:<name>`.
+
+```toml
+[client]
+operations = [
+  "createResponse",
+  "GET /v1/models",
+  "tag:Files",
+]
+prune_models = true
+# Opt in when handlers need auth/tenant/tracing values inserted by middleware.
+context_extensions = false
+```
+
+`prune_models = true` also trims `types.rs`. When client and server selections coexist, the generator retains the union of schemas reachable from both scopes, including inline generated request, response, and parameter types. `[client]` is ignored when `enable_async_client = false`, and it never filters an enabled operation registry.
 
 ## Quick start — Axum server
 
@@ -101,7 +185,31 @@ operations = ["createResponse", "listInputItems"]
 # Drop schemas not reachable from the picked operations. Safe when
 # you're not also generating the HTTP client (the client would lose types).
 prune_models = true
+
+[server.validation]
+enabled = true                 # default
+max_body_bytes = 2097152       # 2 MiB; 1..=64 MiB
+max_errors = 16                # deterministic cap; 1..=100
 ```
+
+Generated handlers validate JSON bodies and supported path, query, header,
+cookie, and form inputs before invoking your trait. Public failures use
+`application/problem+json`: malformed transport is `400`, oversized bodies are
+`413`, undeclared media types are `415`, and schema violations are `422`.
+Messages contain stable codes and JSON Pointer locations, never submitted values,
+Serde/validator text, schema paths, or Rust internals. Generated clients preserve
+documented typed errors and expose this profile lazily through
+`ApiError::problem_details()`.
+
+See [Generated Axum request validation](docs/server-validation.md) for the full
+schema dialect, status, error profile, supported-input, and logging contract.
+
+Set `context_extensions = true` to add a leading `ctx: RequestContext` argument
+to every selected server trait method. `RequestContext::get::<T>()` reads typed
+values inserted into `axum::http::Extensions` by middleware. The generated
+request-parts extractor clones extensions before JSON, multipart, text, or
+binary body extraction; leaving the option unset preserves the normal trait and
+router surface.
 
 Discover and scaffold operations from the CLI:
 
@@ -166,13 +274,15 @@ Two complete examples are in the repo:
 |------|-------------|
 | `types.rs` | All struct/enum definitions from OpenAPI schemas |
 | `client.rs` | Async HTTP client with typed methods per operation (when `enable_async_client`) |
-| `streaming.rs` | SSE streaming **client** with event parsing (when configured) |
+| `sse.rs` | Reusable SSE transport, framing, typed/raw decoding, and reconnection support (when SSE is enabled) |
+| `streaming.rs` | Endpoint-specific SSE request methods backed by `sse.rs` (when configured) |
 | `server/mod.rs` | Module re-exports for the server (when `[server]` is set) |
 | `server/api.rs` | `trait <Tag>Api { async fn <op>(&self, …) -> <Op>Response; }` per tag |
-| `server/errors.rs` | `enum <Op>Response { Ok(T), BadRequest(E), …, OkStream(Sse<…>) }` with `IntoResponse` |
+| `server/errors.rs` | Status-typed response enums with JSON, bodyless, wildcard/default, and status-correct SSE variants plus `IntoResponse` |
 | `server/router.rs` | Per-tag `Router` factory; combined `build_router<…>(…)` for multi-tag selections |
+| `server/validation.rs` | Offline JSON Schema validators and sanitized Problem Details rejections |
 | `mod.rs` | Module declarations + re-exports |
-| `REQUIRED_DEPS.toml` | Crates the generated code references — copy into your consuming crate's `Cargo.toml`. Server scaffolding lists `axum`, `serde`, `serde_json`, and `async-trait`; streaming server variants also expect `futures-core`. |
+| `REQUIRED_DEPS.toml` | Complete direct dependencies and crate features for the exact generated modes and selected operations — append or merge into the consuming `Cargo.toml` |
 
 ### Generated client usage
 
@@ -184,6 +294,7 @@ use crate::generated::types::*;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = HttpClient::new()
         .with_base_url("https://api.example.com")
+        .with_max_response_body_bytes(8 * 1024 * 1024)
         .with_api_key(std::env::var("API_KEY")?);
 
     let req = CreateResourceRequest { /* … */ };
@@ -191,6 +302,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Generated clients cap every response they buffer in memory at 8 MiB by
+default. Set `http_client.max_response_body_bytes` when generating, or use the
+runtime builder above for a particular client. If a cumulative chunked or
+fixed-length body crosses the limit, the call returns
+`HttpError::ResponseTooLarge { limit }` before appending the chunk that would
+exceed it. Successful SSE responses remain streaming; only SSE error responses
+are buffered under the same cap.
 
 ## What the generated types look like
 
@@ -231,7 +350,10 @@ pub custom_id: String,
 pub temperature: Option<f64>,
 ```
 
-> **No runtime validation is generated.** The generator never adds the `validator` crate or `#[validate(...)]` attributes — constraints are documentation only. Validate at boundaries you control.
+> Generated model types do not grow `validator`/`garde` derives or perform
+> validation during construction. When Axum server generation is enabled,
+> request constraints are instead enforced once at the HTTP boundary from the
+> original OpenAPI/JSON Schema source of truth.
 
 ### Discriminated unions (tagged enums)
 
@@ -296,6 +418,11 @@ match resp {
 
 ## Streaming (SSE)
 
+SSE support has two layers: `StreamingConfig` selects and types operations at
+generation time, while generated `sse.rs` owns the transport and parser. The
+transport is also usable directly for APIs whose event payloads are only known
+at runtime.
+
 ```rust
 use openapi_to_rust::streaming::*;
 
@@ -325,12 +452,35 @@ let streaming_config = StreamingConfig {
 Generated event types are tagged enums you can match on directly:
 
 ```rust
-match serde_json::from_str::<ResponseStreamEvent>(&data)? {
-    ResponseStreamEvent::TextDelta(d)  => out.push_str(&d.delta),
-    ResponseStreamEvent::Completed(_)  => break,
-    _                                   => {}
+use futures_util::StreamExt;
+use generated::sse::{SseClient, SseReconnectOptions};
+use generated::types::ResponseStreamEvent;
+
+let client = SseClient::new()
+    .with_reconnect_options(SseReconnectOptions::default());
+let request = client
+    .post("https://api.example.com/v1/responses")
+    .bearer_auth(api_key)
+    .json(&request_body);
+let mut events = client
+    .stream_json_reconnecting::<ResponseStreamEvent>(request)
+    .await?;
+
+while let Some(event) = events.next().await {
+    let event = event?;
+    // event.event, event.id, and event.retry preserve SSE transport metadata.
+    match event.data {
+        ResponseStreamEvent::TextDelta(d) => out.push_str(&d.delta),
+        ResponseStreamEvent::Completed(_) => break,
+        _ => {}
+    }
 }
 ```
+
+Reconnecting streams honor a server-provided `retry:` delay and send the latest
+non-empty event ID as `Last-Event-ID`. Use `stream_raw` or
+`stream_raw_reconnecting` when payloads are not JSON; `stream` retains the
+payload-only typed interface for callers that do not need transport metadata.
 
 The generator also **auto-detects** streaming endpoints: any response declaring `content: text/event-stream` flips `supports_streaming = true` automatically. Explicit `[[streaming.endpoints]]` config still wins when present.
 
@@ -344,6 +494,7 @@ A list of files whose top-level objects are deep-merged into the main spec befor
 
 ```toml
 [generator]
+# Relative paths are resolved from the directory containing this TOML file.
 schema_extensions = ["sse-overlay.json"]
 ```
 
@@ -381,17 +532,32 @@ When the spec declares a fixed enum but the API actually returns values outside 
 Opt out of any individual typed scalar (e.g. fall back to `String` for date-times if you don't want `chrono`):
 
 ```toml
-[generator.types.strategies]
-"date-time" = "string"     # default: "chrono"
-"uri"       = "string"     # default: "url"
-"binary"    = "string"     # default: "bytes"
+[generator.types]
+date_time = "string"        # default: "chrono"
+uri       = "string"        # default: "url"
+binary    = "string"        # default: "bytes"
 ```
 
 The CLI also supports `--types-conservative`, which collapses every typed scalar to `String`/`i64`/etc. Use it when you want zero optional-crate dependencies.
 
+### `[generator.builders]` — additive operation builders
+
+Large operations can keep their existing flat async method and also expose a `*_builder()` entry point:
+
+```toml
+[generator.builders]
+enabled = true
+threshold = 3
+```
+
+A builder is emitted when its optional query/header/body values and reachable optional request-body fields exceed `threshold`. Required path, query, header, and request-model values stay explicit. Setters own their values, and `.send().await` delegates to the existing flat method, so request serialization and response errors stay identical. Builder generation is disabled by default to preserve existing generated call sites.
+
 ## OpenAPI 3.1 / 3.2 support
 
-The generator accepts 3.0.x and 3.1.x specs; 3.2.x parses with an `experimental` warning. Unknown OpenAPI extensions (anything not prefixed with `x-`) surface as a hard error at parse time — silent drops are not a thing here.
+The generator accepts 3.0.x and 3.1.x specs; 3.2.x parses with an
+`experimental` warning. Unknown fields are retained for compatibility, but an
+unrecognized field may be ignored by analysis and code generation. Add a
+focused fixture when relying on a less-common OpenAPI or JSON Schema keyword.
 
 **3.1 (JSON Schema 2020-12) keywords now modeled and read from typed fields:**
 
@@ -418,13 +584,27 @@ The generator accepts 3.0.x and 3.1.x specs; 3.2.x parses with an `experimental`
 | `MediaType.itemSchema`, `prefixEncoding`, `itemEncoding` | typed |
 | `mediaTypes` in Components | typed |
 
-**Components family (typed end-to-end):** `Server`, `ServerVariable`, `SecurityScheme` (apiKey / http / mutualTLS / oauth2 / openIdConnect with all flows), `OAuthFlows`, `Encoding`, `Header`, `Example`, `Link`, `Callback`, `Tag`, `ExternalDocs`, `Discriminator`. Everything is `Extensions`-strict: unknown non-`x-*` fields fail loudly at deserialize time.
+**Modeled Components family:** `Server`, `ServerVariable`, `SecurityScheme` (apiKey / http / mutualTLS / oauth2 / openIdConnect with all flows), `OAuthFlows`, `Encoding`, `Header`, `Example`, `Link`, `Callback`, `Tag`, `ExternalDocs`, `Discriminator`. Modeling does not imply runtime support for every security or linking behavior; for example, mutual TLS credentials are not configured by generated clients.
 
-A full conformance harness lives under `tests/conformance/` with fixture files and a `status.toml` recording what's L0-typed vs. L3-flowing-through-codegen. The JSON-Schema-Test-Suite (git submodule) runs as a separate test.
+The fixture harness under `tests/conformance/` currently gates lossless L0
+parsing; its later L1–L5 markers are tracked but deferred. The vendored JSON
+Schema Test Suite runner enforces a no-regression ceiling for parse failures
+and lossless round trips; it does not yet enforce semantic, feature-level pass
+thresholds.
 
 ## CLI
 
 ```bash
+# Direct mode: client by default; use --types-only to omit it.
+openapi-to-rust generate openapi.yaml
+openapi-to-rust generate https://example.com/openapi.json --dry-run --json
+openapi-to-rust generate openapi.yaml --check --quiet
+
+# Create a starter config, then generate with the config defaults.
+openapi-to-rust init openapi.yaml
+openapi-to-rust generate
+
+# Explicit config mode.
 openapi-to-rust generate --config openapi-to-rust.toml
 openapi-to-rust generate --config openapi-to-rust.toml --types-conservative
 openapi-to-rust validate --config openapi-to-rust.toml
@@ -462,6 +642,7 @@ registry_only = false                   # only generate the registry (skip types
 [http_client]
 base_url = "https://api.example.com"
 timeout_seconds = 30                    # 1-3600
+max_response_body_bytes = 8388608       # buffered responses; 8 MiB default
 
 [http_client.retry]
 max_retries = 3                         # 0-10
@@ -500,10 +681,22 @@ operations = [                          # selectors: operationId | "METHOD /path
   "POST /v1/messages",
   "tag:Responses",
 ]
-prune_models = false                    # drop schemas unreachable from picked ops
-                                        # (safe only when not also generating the HTTP client)
-context_extensions = false              # when true, every trait method gains leading
-                                        # `ctx: RequestContext` (clone of request Extensions)
+prune_models = false                    # drop schemas outside the combined selected
+                                        # client/server operation closure
+context_extensions = false              # true adds leading `ctx: RequestContext`
+
+[server.validation]
+enabled = true
+max_body_bytes = 2097152
+max_errors = 16
+
+[client]
+operations = [                          # absent or empty means every client operation
+  "createResponse",
+  "GET /v1/models",
+  "tag:Files",
+]
+prune_models = false                    # opt in to the same union model pruning
 
 [nullable_overrides]
 "Response.error" = true                 # see "Spec-quirk overrides" above
@@ -514,13 +707,24 @@ context_extensions = false              # when true, every trait method gains le
 [type_mappings]
 "DateTime" = "chrono::DateTime<chrono::Utc>"
 
-[generator.types.strategies]
-"date-time" = "chrono"                  # chrono (default) | string
-"uri"       = "url"                     # url     (default) | string
-"binary"    = "bytes"                   # bytes   (default) | string
-"uuid"      = "uuid"                    # uuid    (default) | string
-"byte"      = "vec_u8_base64"           # default; encodes/decodes via base64
+[generator.types]
+date_time = "chrono"                     # chrono (default) | time | string
+uri       = "url"                        # url     (default) | string
+binary    = "bytes"                      # bytes   (default) | vec_u8 | string
+uuid      = "uuid"                       # uuid    (default) | string
+byte      = "base64"                     # base64 (default) | base64_url_unpadded | vec_u8 | string
+unsigned  = true                         # uint32/uint64 -> u32/u64
+float_precision = "f64"                  # f64 (default) | f32 — see below
+
+[generator.types.shape]
+additional_properties_typed = true
 ```
+
+**`format: float` maps to `f64`, not `f32`.** JSON carries no binary32, so the
+declared format describes the server's storage rather than the transport. A
+price sent on the wire as `0.03` parses losslessly into `f64`, but through
+`f32` it becomes `0.029999999329447746` — a real hazard when the field is
+money. Set `float_precision = "f32"` to map strictly by declared format.
 
 ## Testing
 
@@ -531,7 +735,24 @@ cargo insta review        # review snapshot diffs
 scripts/spec-compile.sh   # generate + cargo-check every spec in specs/ (full corpus)
 ```
 
-CI runs the gold list (Anthropic, OpenAI, and a curated set covering the worst-behaved real-world specs) as a regression guard. Local `scripts/spec-compile.sh` runs the full 54-spec corpus.
+The compile tiers are intentionally different:
+
+- Every pull request and push to `main` generates all 55 supported OpenAPI
+  specs, then compile-checks the Anthropic and OpenAI production specs against
+  each generated `REQUIRED_DEPS.toml`.
+- Weekly scheduled CI and manual workflow runs generate all 55 supported
+  OpenAPI specs and compile-check 54. Microsoft Graph is reported as
+  generate-only because its generated crate exceeds the 16 GB runner; the
+  bundled Gitea Swagger 2.0 document is reported as skipped.
+- Local `scripts/spec-compile.sh` runs the same full tier; pass spec names as
+  arguments for a smaller targeted run. On a machine with sufficient memory,
+  `SPEC_COMPILE_FORCE_CHECK=1 scripts/spec-compile.sh microsoft-graph` also
+  compile-checks Microsoft Graph (about 19 GB peak RSS on the current corpus).
+- Every pull request also starts the generated OpenAI Responses and Anthropic
+  Messages Axum examples on loopback and exercises them through pinned official
+  Python SDKs. The compatibility gates cover unary and streaming responses,
+  with the OpenAI row also covering input-item path/query parameters and the
+  organization costs query.
 
 ## Examples
 
@@ -553,129 +774,23 @@ cargo run -p openapi-to-rust -- generate --config examples/server-anthropic-mess
 cargo run --manifest-path examples/server-anthropic-messages/Cargo.toml
 ```
 
-## Release notes
+## Versioning
 
-### 0.5.5
-
-**Clippy / test hygiene**
-- `tests/inline_object_array_test.rs` now uses Result-returning tests instead of `expect` on generation Results, matching the fork's preferred test style under the unwrap/expect policy.
-- Unit-test modules in `src/server/{edit,list,selector}.rs` and `src/type_mapping.rs` follow the existing `openapi`/`patterns` convention of allowing unwrap/expect only inside `#[cfg(test)]`.
-- A few `field_reassign_with_default` and `for_kv_map` nits in tests cleaned up so `cargo clippy --all-targets -- -D warnings` is green.
-- Unwrap/expect deny/warn is enforced on the library crate (`src/lib.rs`) and main binary rather than package-wide, so integration tests and examples are not forced through the same panic policy. Library API is unchanged.
-
-### 0.5.4
-
-**Opt-in request context on server traits**
-- New `[server].context_extensions` flag (default `false`). When unset/false, generated server output is byte-identical to 0.5.3.
-- When `true`, every generated trait method gains a leading `ctx: RequestContext` parameter. Handlers construct it as `RequestContext(parts.extensions.clone())` before body extraction, so middleware-settled state (auth, tenancy, etc.) is available without ambient task-locals.
-- Emits once per generation: `#[derive(Clone)] pub struct RequestContext(pub axum::http::Extensions)` with `get<T>()` delegating to `Extensions::get`.
-- Response enums, routers factories, and DTOs are otherwise unchanged; trait-object / router plumbing still compiles in both flag states.
-- Golden fixtures under `tests/fixtures/v0_5_4/`.
-
-### 0.5.3
-
-**Dependency modernization (library-consumer graph)**
-- Remote OpenAPI URL fetching is now an optional `fetch` cargo feature (off by default). The default library / build-dependency graph no longer pulls `reqwest`, and therefore no longer pulls `native-tls`, `openssl`, or `rustls-pemfile` (the latter carries an unmaintained RUSTSEC that fails cargo-deny in consumers).
-- When `fetch` is enabled, reqwest is 0.12 with `default-features = false` and `rustls-tls` only.
-- Direct `reqwest-middleware` / `reqwest-retry` library dependencies were removed (they were only referenced as tokens in generated client source; consumers of generated clients still declare them themselves).
-- Replaced archived `serde_yaml` with maintained `serde_yaml_ng`.
-- Library `HttpError::Network` is now a `String` (no reqwest type in the library API); generated clients still emit their own `HttpError` wrapping `reqwest::Error`.
-
-**allOf if/then conditional required**
-- Schemas that combine `type: object` with sibling `allOf: [{ if, then }]` (and top-level `if`/`then`/`else`) keep the merged struct.
-- Conditional `then.required` is **not** promoted into unconditional Rust required fields.
-- Dropped conditions are documented on the generated type under a "Conditional requirements (if/then)" rustdoc section, and analysis prints a generation-time warning listing each condition.
-- Chosen depth: merged struct + rustdoc + warning (not variant enums per condition). Full typed modeling of if/then would be a larger design; this is the clean floor that matches existing generator patterns.
-
-**Full-contract Schema parse gap**
-- Root cause: JSON Schema boolean schemas (`true` / `false`) were not modeled on the untagged `Schema` enum. Real hit: `HoldAction.then.properties.split: false` in a large customer contract (~216 schemas), which failed with `data did not match any variant of untagged enum Schema`.
-- Fix: `Schema::Boolean(bool)` plus handling in analysis/merge so boolean property schemas do not break parse or codegen.
-- Minimized golden fixtures under `tests/fixtures/v0_5_3/`.
-
-### 0.5.2
-
-**Server codegen hardening**
-- Axum server traits now emit `#[async_trait::async_trait]` instead of `#[axum::async_trait]`, so generated server code works with axum 0.8 where the macro is no longer re-exported.
-- Server-side path, query, and header parameters now reuse the analyzer's deduplicated, keyword-safe Rust identifiers. Query parameters named `type`, `ref`, etc. compile as raw identifiers such as `r#type`, matching the existing client-side behavior.
-- Operation responses that `$ref` reusable `#/components/responses/*` objects now resolve before response enum generation, so shared public error envelopes and success responses are not silently dropped from generated server response enums.
-- `REQUIRED_DEPS.toml` now includes the framework crates required by generated server scaffolding (`axum`, `async-trait`, `serde`, and `serde_json`).
-- The end-to-end axum server examples were moved to axum 0.8 and `async-trait`.
-
-### 0.5 (this release)
-
-**Server codegen (Axum)**
-- `[server]` TOML section with selector grammar (operationId / `METHOD /path` / `tag:<name>`).
-- `openapi-to-rust server list / add / remove` with `--all-tag`, `--dry-run`, `--regenerate`, `--json`. Edits preserve TOML formatting via `toml_edit`. Typos get Levenshtein "Did you mean …?" suggestions.
-- Emits `server/{mod,api,errors,router}.rs`: trait per tag, status-code-typed response enum with `IntoResponse`, conditional `OkStream(Sse<…>)` variant, per-tag and combined `build_router<…>(…)` factory.
-- Query + header parameters wired through the trait. Required query/header params arrive unwrapped; missing-required short-circuits to HTTP 400 + `{"error": "missing required …"}` JSON.
-- Generated `sse_response(stream)` helper — wraps any `Stream<Item = Result<Event, Infallible>>` so the SSE branch stays two lines.
-- End-of-generate hint prints a paste-ready impl skeleton.
-- `[server].prune_models = true` (opt-in) trims `types.rs` to schemas reachable from picked ops (OpenAI example: drops 280 of 2154 schemas, ~3300 fewer lines).
-- Two end-to-end examples: `server-openai-responses` (multi-tag, body + SSE, four query params, required-param 400) and `server-anthropic-messages` (SSE overlay).
-
-**OpenAPI 3.1 + 3.2 conformance (38 of 51 beads from #14)**
-- Strict spec extensions (`Extensions` newtype rejects unknown non-`x-` keys) + version gate (3.0 / 3.1 accepted, 3.2 experimental, others hard error).
-- Full Components family typed end-to-end: `Server`, `ServerVariable`, `SecurityScheme` (apiKey/http/mutualTLS/oauth2/openIdConnect), `OAuthFlows`, `Encoding`, `Header`, `Example`, `Link`, `Callback`, `Tag`, `ExternalDocs`, `Discriminator`.
-- JSON Schema 2020-12 keywords typed: `prefixItems`, `patternProperties`, `propertyNames`, `unevaluatedItems`/`Properties`, `dependentRequired`/`Schemas`, `contains`/`min`/`maxContains`, `contentEncoding`/`MediaType`/`Schema`, `if`/`then`/`else`, `$dynamicRef`/`$dynamicAnchor`, `$defs`, `$id`, `$schema`, `$comment`.
-- 3.2 deltas: `query` HTTP method, `additionalOperations` (arbitrary verbs), OAuth `deviceAuthorization`, `Server.name`, `Tag.parent`/`kind`/`summary`, `Discriminator.defaultMapping`, `MediaType.itemSchema`/`prefixEncoding`/`itemEncoding`, `mediaTypes` components.
-- `type` as array (3.1 canonical nullability — `type: ["string", "null"]`) merges cleanly with the 3.0 `nullable: true` field.
-- Webhooks (`webhooks:`) ingested as operations.
-- Path Item `$ref` resolution (`$ref: "#/components/pathItems/X"`).
-- Conformance harness with fixtures, layered `fails_at:` markers, `status.toml`, and the JSON-Schema-Test-Suite as a git submodule.
-
-**Real-world spec compile guarantee (54 specs in CI)**
-- `r#self`/`r#super`/`r#crate`/`r#Self` panic → rename to `<keyword>_field`/`<keyword>_param` (proc_macro2 doesn't accept those as raw idents).
-- OperationId collisions → auto-disambiguate by HTTP method (`opId_post`) with a stderr warning, instead of rejecting the whole document.
-- `exclusiveMinimum` modeled as `bool | f64` (3.0/Swagger used bool; 3.1 uses number).
-- Signed enum variants disambiguated (`Variant1` vs `VariantNeg1`).
-- Twilio-style `<` / `>` / `<=` / `>=` filter params sanitized to `_lt`/`_gt`/`_lte`/`_gte`.
-- Self-referential union variants boxed to break infinite-size enums.
-- Nullable-anyOf wrapper collisions resolved (don't synthesize a wrapper that overwrites the inner `$ref`'s schema).
-- `$ref` shape variants accepted (`#/definitions/X` Swagger carry-over, `#/components/parameters/X/schema` falls back to `Value`).
-- Per-method parameter ident collisions resolved at analysis time (`exclude_ids` + `exclude-ids` get unique `rust_ident`s).
-- Empty/non-string enum values coerced via Display (gitpod's numeric values on a string-typed schema).
-- Optional request bodies (`required: false`) wrapped in `Option<T>` and chained with `if let Some(...)` so the request builder typechecks.
-- `$ref`-typed parameter types resolved to the referenced enum (instead of silently falling back to `String`).
-- String enums emit `as_str()`, `Display`, and `AsRef<str>` impls so the wire form drops cleanly into headers, query strings, and path segments.
-- `cargo clippy --all-features -- -D warnings` is clean.
-
-**Codegen quality fixes**
-- T1: header request parameters wired through codegen.
-- T2: HEAD/OPTIONS/PATCH/TRACE methods emitted explicitly (was a silent `_ => get` fallback).
-- T3: `auth_config` `ApiKey` / `Custom` variants honored at runtime — README's multi-scheme-auth claim is now actually true.
-- T4: webhooks walked in analysis.
-- T5: path templating percent-encoded per RFC 3986 §3.3 via an emitted `__pct_encode_path_segment` helper.
-- T6: operationId collisions detected loudly at analysis time.
-- T8: range status codes (`1XX`/`2XX`/`3XX`/`4XX`/`5XX`) get guarded match arms instead of falling through to the generic default.
-- T10: `$ref`-typed parameter types resolved.
-- T11: optional request bodies → `Option<T>`.
-- T13: spec `description`/`summary` surfaced as rustdoc on each operation method.
-- T15: SSE auto-detection from `text/event-stream` responses.
-- F1: strict spec extensions + version gate.
-- F2: `type` as array (3.1 nullability).
-- F4: paths-less specs (components-only / webhooks-only) accepted.
-
-**Typed scalars (Q2 series)**
-- `TypeMapper` chokepoint for format-driven type mapping.
-- `format: date-time` → `chrono::DateTime<Utc>`, `uri` → `url::Url`, `binary` → `bytes::Bytes`, `uuid` → `uuid::Uuid`, `byte` → `Vec<u8>` + base64 codec.
-- Unsigned-int formats (`uint32`, `uint64`, etc.) → `u32`/`u64`.
-- Typed `additionalProperties` → `BTreeMap<String, T>`.
-- `x-enum-varnames` honored.
-- Constraint doc comments (`minLength`/`maxLength`/`minimum`/`pattern`).
-- Per-format strategy opt-out via `[generator.types.strategies]`; `--types-conservative` flag.
-- `REQUIRED_DEPS.toml` emitted listing optional crates the generated code references (+ stderr advisory).
-- Clean primitive variants for `anyOf` unions.
-
-**Other**
-- Hybrid string-or-object unions, `allOf`-nullable handling, `[extensible_enums]` override.
+Until 1.0.0, a minor version may change generated Rust APIs when correcting
+output that was wrong or incomplete on the wire. Regenerating lets the compiler
+identify affected call sites. See the [changelog](CHANGELOG.md) for release
+history and migration notes.
 
 ## Contributing
 
-1. Fork the repo
-2. Add your OpenAPI spec or pattern to `specs/` or `tests/fixtures/`
-3. Write a snapshot test (`insta`)
-4. Run `cargo insta test` and review output
-5. Open a PR
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, targeted test commands,
+snapshot guidance, and the generated-API compatibility checklist. Questions
+belong in [GitHub Discussions](https://github.com/gpu-cli/openapi-to-rust/discussions);
+bugs and concrete feature requests use the repository issue forms.
+
+By participating, you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+Security reports follow [SECURITY.md](SECURITY.md); please do not file a public
+issue for a suspected vulnerability.
 
 ## License
 

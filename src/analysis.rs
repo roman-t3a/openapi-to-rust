@@ -71,11 +71,20 @@ pub struct SchemaAnalysis {
     pub patterns: DetectedPatterns,
     /// OpenAPI operations and their request/response schemas
     pub operations: BTreeMap<String, OperationInfo>,
+    /// Complete response contracts by emitted operation ID and response key.
+    /// Unlike `OperationInfo::response_schemas`, this retains responses with
+    /// no body as well as their selected JSON media type and SSE declaration.
+    pub operation_responses: BTreeMap<String, BTreeMap<String, OperationResponse>>,
+    /// Source operationId to emitted operation IDs. Duplicate or
+    /// Rust-identifier-colliding IDs are renamed during analysis; retaining
+    /// this mapping lets selector resolution report ambiguity or renaming.
+    pub operation_id_aliases: BTreeMap<String, Vec<String>>,
     /// Optional crates the [`TypeMapper`] was asked to reference
     /// during analysis (e.g. chrono when a `format: date-time` field
     /// became `chrono::DateTime<Utc>`). The generator reads this to
-    /// decide which helper modules (e.g. `base64_serde`) to emit.
-    /// Q2.8 will additionally use it to write `REQUIRED_DEPS.toml`.
+    /// decide which helper modules (e.g. `base64_serde`) to emit. Complete
+    /// dependency reporting is collected from retained emitted files so
+    /// pruned schemas cannot leak stale requirements.
     ///
     /// [`TypeMapper`]: crate::type_mapping::TypeMapper
     pub used_type_features: crate::type_mapping::UsedFeatures,
@@ -87,6 +96,56 @@ pub struct SchemaAnalysis {
     /// comments. Indexed by analyzed-schema name. Side-channel so we
     /// don't have to touch every StringEnum constructor.
     pub enum_extensions: BTreeMap<String, EnumExtensions>,
+    /// Raw, unpruned schema material used to build offline server validators.
+    /// This is deliberately independent of `schemas`, which model pruning may
+    /// mutate before server artifacts are emitted.
+    pub validation_context: ValidationContext,
+}
+
+/// Server-relevant semantics of one OpenAPI Response Object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OperationResponse {
+    /// Generated Rust body type for the preferred JSON-compatible content.
+    pub schema_name: Option<String>,
+    /// Exact declared JSON-compatible media type selected for `schema_name`.
+    pub media_type: Option<String>,
+    /// Preferred buffered response representation for this status. JSON keeps
+    /// its generated schema name; text and binary bodies are represented
+    /// directly by the generated client/server runtime types.
+    pub body: Option<OperationResponseBody>,
+    /// Whether this response also declares `text/event-stream` content.
+    pub supports_streaming: bool,
+    /// Whether the Response Object declared at least one content entry.
+    pub has_content: bool,
+    /// Declared response media types the server generator cannot emit.
+    pub unsupported_media_types: Vec<String>,
+}
+
+/// Buffered response representation selected from one OpenAPI Response Object.
+/// SSE remains orthogonal on [`OperationResponse::supports_streaming`] because
+/// a response may advertise both a buffered JSON representation and an event
+/// stream.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperationResponseBody {
+    Json {
+        schema_name: String,
+        media_type: String,
+    },
+    Text {
+        media_type: String,
+    },
+    Binary {
+        media_type: String,
+        wildcard: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ValidationContext {
+    pub openapi_version: String,
+    pub json_schema_dialect: Option<String>,
+    pub component_schemas: BTreeMap<String, Value>,
 }
 
 /// Q2.6 — vendor extensions describing a string enum's variant
@@ -321,19 +380,56 @@ pub struct OperationInfo {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind")]
 pub enum RequestBodyContent {
-    Json { schema_name: String },
-    FormUrlEncoded { schema_name: String },
-    Multipart,
-    OctetStream,
-    TextPlain,
+    Json {
+        schema_name: String,
+        media_type: String,
+        #[serde(skip)]
+        validation_schema: Value,
+    },
+    FormUrlEncoded {
+        schema_name: String,
+        media_type: String,
+        #[serde(skip)]
+        validation_schema: Value,
+    },
+    Multipart {
+        schema_name: String,
+        media_type: String,
+        #[serde(skip)]
+        validation_schema: Value,
+    },
+    OctetStream {
+        media_type: String,
+    },
+    Binary {
+        media_type: String,
+    },
+    TextPlain {
+        media_type: String,
+    },
+    /// A declared request media type without a schema. Client generation
+    /// preserves its historical no-body signature, while server generation
+    /// rejects the operation because there is no contract to validate.
+    SchemaLess {
+        media_type: String,
+    },
+    Unsupported {
+        media_types: Vec<String>,
+    },
 }
 
 impl RequestBodyContent {
     /// Get the schema name if this content type has one
     pub fn schema_name(&self) -> Option<&str> {
         match self {
-            Self::Json { schema_name } | Self::FormUrlEncoded { schema_name } => Some(schema_name),
-            _ => None,
+            Self::Json { schema_name, .. }
+            | Self::FormUrlEncoded { schema_name, .. }
+            | Self::Multipart { schema_name, .. } => Some(schema_name),
+            Self::OctetStream { .. }
+            | Self::Binary { .. }
+            | Self::TextPlain { .. }
+            | Self::SchemaLess { .. }
+            | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -356,6 +452,11 @@ fn base_param_ident(name: &str) -> String {
     };
     let stripped = name.trim_end_matches(['<', '>', '=']);
     let mut snake = stripped.to_snake_case();
+    if snake.is_empty() {
+        snake.push_str("parameter");
+    } else if snake.starts_with(|character: char| character.is_ascii_digit()) {
+        snake.insert(0, '_');
+    }
     snake.push_str(suffix);
     snake
 }
@@ -382,6 +483,13 @@ pub struct ParameterInfo {
     /// See issue #10 follow-up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<String>>,
+    /// `x-enum-varnames` declared on the parameter's inline enum schema, when
+    /// present and the same length as `enum_values`. Schema-level enums already
+    /// honor this vendor extension through `SchemaAnalysis::enum_extensions`;
+    /// parameter enums are inline and have no analyzed-schema name to key on,
+    /// so their names ride along here instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_varnames: Option<Vec<String>>,
     /// Disambiguated Rust ident assigned by the analyzer at the operation
     /// scope. When two parameters in the same operation sanitize to the same
     /// snake_case name (e.g. `exclude_ids` + `exclude-ids` in vercel,
@@ -391,6 +499,114 @@ pub struct ParameterInfo {
     /// Empty/none = use sanitize from `name`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_ident: Option<String>,
+    /// Wire serialization for object/array query parameters, decided from
+    /// the parameter's `style`/`explode` and schema shape (T14, GH #27).
+    /// `None` = plain single `name=value` pair (scalars, string enums, and
+    /// the ordinary scalar `name=value` representation. Unsupported complex
+    /// shapes carry an explicit [`QuerySerialization::Unsupported`] reason so
+    /// downstream client/server generators cannot silently drift.
+    /// For the object modes, `schema_ref` holds the struct type
+    /// generated/resolved for the object schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_serialization: Option<QuerySerialization>,
+    /// Original parameter schema retained for request validation. This is not
+    /// exposed by serialized operation listings.
+    #[serde(skip)]
+    pub validation_schema: Option<Value>,
+}
+
+/// How generated clients serialize and generated servers extract an object-
+/// or array-schema query parameter.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum QuerySerialization {
+    /// style=form + explode=true object (the OAS 3.x defaults for query):
+    /// each property is its own pair — `?color=red&size=big`. The parameter
+    /// name never appears in the query string (RFC 6570 form-explosion).
+    FormExplodedObject,
+    /// AWS query-protocol form explosion for an object containing arrays:
+    /// `Parameter.Prop.1=value` or `Parameter.Prop.1.Leaf=value`. Unlike
+    /// ordinary RFC 6570 form explosion, AWS service models retain the outer
+    /// parameter wire name; client and server generation intentionally mirror
+    /// that protocol-specific representation.
+    FormExplodedNestedObject {
+        properties: Vec<QueryStructProperty>,
+    },
+    /// style=form + explode=false object: one comma-joined key,value list —
+    /// `?filter=color,red,size,big`.
+    FormObject,
+    /// style=deepObject (explode=true) object: bracketed keys —
+    /// `?filter[color]=red`.
+    DeepObject,
+    /// style=form + explode=true array: repeated pairs — `?tags=a&tags=b`.
+    /// Parameter typed `Vec<item_type>`.
+    FormExplodedArray { item_type: ArrayItemType },
+    /// style=form + explode=false array: one comma-joined pair —
+    /// `?tags=a,b,c`. Parameter typed `Vec<item_type>`.
+    FormArray { item_type: ArrayItemType },
+    /// Header `style=simple, explode=false` array: one physical header value
+    /// containing comma-separated scalar items.
+    SimpleHeaderArray { item_type: ArrayItemType },
+    /// A complex query shape whose wire representation is undefined by
+    /// OpenAPI or not implemented symmetrically. Clients retain the explicit
+    /// opaque-string escape hatch; server generation rejects it with this
+    /// actionable reason instead of emitting an impossible extractor.
+    Unsupported { reason: String },
+}
+
+/// Item type of a typed array query parameter. The two variants need
+/// different handling in codegen: scalars are already Rust type strings
+/// (possibly paths like `rust_decimal::Decimal` from `[type_mappings]`),
+/// while schema refs are raw *schema names* that must run through
+/// `to_rust_type_name` sanitization (cloudflare:
+/// `resource-sharing_resource_type`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum ArrayItemType {
+    /// A Rust scalar type string from the TypeMapper (`String`, `i32`, …).
+    Scalar(String),
+    /// The schema name of a referenced scalar alias or string enum.
+    SchemaRef(String),
+    /// The schema name of a referenced *flat* structure — every property is
+    /// scalar. Serialized AWS query-protocol style as
+    /// `param.N.Prop=value` per item (e.g. `Tags.1.Key=k&Tags.1.Value=v`).
+    /// Carries the wire property names so client and server emit identical
+    /// keys without re-resolving the schema.
+    FlatStructRef {
+        schema_name: String,
+        properties: Vec<QueryStructProperty>,
+    },
+    /// A referenced structure with scalar properties plus arrays whose items
+    /// are scalar or flat structures. This is the deepest unambiguous shape
+    /// used by AWS query protocols (`param.N.Prop.M.Leaf=value`).
+    NestedStructRef {
+        schema_name: String,
+        properties: Vec<QueryStructProperty>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct QueryStructProperty {
+    pub wire_name: String,
+    pub required: bool,
+    pub value_type: QueryStructPropertyType,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum QueryStructPropertyType {
+    Scalar(QueryScalarType),
+    Array {
+        item_type: ArrayItemType,
+    },
+    Object {
+        properties: Vec<QueryStructProperty>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum QueryScalarType {
+    String,
+    Integer,
+    Number,
+    Boolean,
 }
 
 impl Default for DependencyGraph {
@@ -546,13 +762,97 @@ pub fn merge_schema_extensions(
     Ok(result)
 }
 
-/// Load an extension file and parse as JSON
+/// AWS-style specs append query markers to their path templates
+/// (`/tags/{resourceArn}#tagKeys`, `/2015-02-01/resource-tags/{ResourceId}#tagKeys`).
+/// The fragment is not part of the route — those values are declared as
+/// ordinary query parameters on the operation — so strip it before the path
+/// reaches route generation. Axum (and every HTTP router) matches on the path
+/// component only.
+fn normalize_operation_path(path: &str) -> String {
+    match path.split_once('#') {
+        Some((route, _fragment)) if route.starts_with('/') => route.to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// See through an `allOf: [$ref, {annotation}]` wrapper around a schema, the
+/// same shape `analyze_all_of` treats as a type alias. Returns the sole
+/// reference target's schema when every other member is annotation-only;
+/// otherwise the schema itself.
+fn unwrap_annotation_allof(schema: &crate::openapi::Schema) -> &crate::openapi::Schema {
+    let crate::openapi::Schema::AllOf { all_of, .. } = schema else {
+        return schema;
+    };
+    let mut references = all_of.iter().filter(|s| s.reference().is_some());
+    let (Some(first), None) = (references.next(), references.next()) else {
+        return schema;
+    };
+    let others_annotation_only = all_of.iter().all(|member| {
+        if member.reference().is_some() {
+            return true;
+        }
+        serde_json::to_value(member)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "title"
+                            | "description"
+                            | "deprecated"
+                            | "readOnly"
+                            | "writeOnly"
+                            | "examples"
+                            | "example"
+                            | "externalDocs"
+                            | "xml"
+                            | "$comment"
+                    ) || key.starts_with("x-")
+                })
+            })
+    });
+    if others_annotation_only {
+        first
+    } else {
+        schema
+    }
+}
+
+/// Load an extension file and parse it into the JSON representation used by
+/// the analyzer. YAML extensions follow the same conversion policy as YAML
+/// OpenAPI documents; every other extension is parsed as JSON.
 fn load_extension_file(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path).map_err(|e| GeneratorError::FileError {
         message: format!("Failed to read file {}: {}", path.display(), e),
     })?;
 
-    serde_json::from_str(&content).map_err(GeneratorError::ParseError)
+    let is_yaml = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
+        });
+
+    if is_yaml {
+        crate::spec_source::yaml_to_json_value(&content).map_err(|error| {
+            GeneratorError::FileError {
+                message: format!(
+                    "Failed to parse schema extension {} as YAML: {}",
+                    path.display(),
+                    error
+                ),
+            }
+        })
+    } else {
+        serde_json::from_str(&content).map_err(|error| GeneratorError::FileError {
+            message: format!(
+                "Failed to parse schema extension {} as JSON: {}",
+                path.display(),
+                error
+            ),
+        })
+    }
 }
 
 /// Merge JSON objects with explicit replacement support
@@ -765,7 +1065,6 @@ pub struct SchemaAnalyzer {
     openapi_spec: Value,
     current_schema_name: Option<String>,
     component_parameters: BTreeMap<String, crate::openapi::Parameter>,
-    component_responses: BTreeMap<String, crate::openapi::Response>,
     /// Single chokepoint for `(openapi_type, format)` → Rust-type
     /// decisions (Q2.0). Defaulted when the analyzer is built without a
     /// config; threaded from `GeneratorConfig.types` via
@@ -774,6 +1073,13 @@ pub struct SchemaAnalyzer {
 }
 
 impl SchemaAnalyzer {
+    fn uses_aws_query_conventions(&self) -> bool {
+        self.openapi_spec
+            .pointer("/info/x-providerName")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("amazonaws.com"))
+    }
+
     /// Construct an analyzer with a default [`TypeMapper`]. Pre-Q2.0
     /// callers (tests, simple bins) use this and get bit-identical
     /// behavior to the pre-refactor code.
@@ -795,20 +1101,12 @@ impl SchemaAnalyzer {
             .and_then(|c| c.parameters.as_ref())
             .cloned()
             .unwrap_or_default();
-        let component_responses = spec
-            .components
-            .as_ref()
-            .and_then(|c| c.responses.as_ref())
-            .cloned()
-            .unwrap_or_default();
-
         Ok(Self {
             schemas,
             resolved_cache: BTreeMap::new(),
             openapi_spec,
             current_schema_name: None,
             component_parameters,
-            component_responses,
             type_mapper,
         })
     }
@@ -924,6 +1222,30 @@ impl SchemaAnalyzer {
     }
 
     pub fn analyze(&mut self) -> Result<SchemaAnalysis> {
+        let validation_context = ValidationContext {
+            openapi_version: self
+                .openapi_spec
+                .get("openapi")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            json_schema_dialect: self
+                .openapi_spec
+                .get("jsonSchemaDialect")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            component_schemas: self
+                .openapi_spec
+                .pointer("/components/schemas")
+                .and_then(Value::as_object)
+                .map(|schemas| {
+                    schemas
+                        .iter()
+                        .map(|(name, schema)| (name.clone(), schema.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
         let mut analysis = SchemaAnalysis {
             schemas: BTreeMap::new(),
             dependencies: DependencyGraph::new(),
@@ -933,8 +1255,11 @@ impl SchemaAnalyzer {
                 type_mappings: BTreeMap::new(),
             },
             operations: BTreeMap::new(),
+            operation_responses: BTreeMap::new(),
+            operation_id_aliases: BTreeMap::new(),
             used_type_features: crate::type_mapping::UsedFeatures::default(),
             enum_extensions: BTreeMap::new(),
+            validation_context,
         };
 
         // First pass: detect patterns
@@ -1392,19 +1717,13 @@ impl SchemaAnalyzer {
         let mut dependencies = HashSet::new();
 
         let schema_type = match schema {
-            Schema::Boolean(true) => SchemaType::Primitive {
-                rust_type: "serde_json::Value".to_string(),
+            // Boolean JSON Schemas carry validation semantics rather than a
+            // structural Rust type. Preserve the value surface as dynamic
+            // JSON; generated server validation still enforces `false`.
+            Schema::Boolean(_) => SchemaType::Primitive {
+                rust_type: self.type_mapper.dynamic_json().rust_type,
                 serde_with: None,
             },
-            Schema::Boolean(false) => {
-                // `false` schema rejects every instance; surface as unit-like
-                // opaque Value so the rest of generation can proceed. Callers
-                // almost never name a top-level `false` schema.
-                SchemaType::Primitive {
-                    rust_type: "serde_json::Value".to_string(),
-                    serde_with: None,
-                }
-            }
             Schema::Reference { reference, .. } => {
                 // For real-world refs we can't resolve to a known schema name
                 // (e.g. pagerduty's `#/components/parameters/foo/schema`),
@@ -1566,10 +1885,9 @@ impl SchemaAnalyzer {
             }
         };
 
-        // JSON Schema if/then/else (top-level or allOf sibling) is not lowered
-        // into Rust variant enums: the merged struct stays, and we surface the
-        // dropped conditions as rustdoc + a generation-time warning so callers
-        // know serde will not enforce them.
+        // JSON Schema if/then/else is validation policy rather than a Rust
+        // type shape. Keep the merged model ergonomic, but make every dropped
+        // condition visible in generated rustdoc and during generation.
         let conditional_notes = Self::collect_dropped_conditionals(schema);
         if !conditional_notes.is_empty() {
             for note in &conditional_notes {
@@ -1584,12 +1902,12 @@ impl SchemaAnalyzer {
                  unconditionally `required`):\n{}",
                 conditional_notes
                     .iter()
-                    .map(|n| format!("- {n}"))
+                    .map(|note| format!("- {note}"))
                     .collect::<Vec<_>>()
                     .join("\n")
             );
             description = Some(match description {
-                Some(d) => format!("{d}{block}"),
+                Some(existing) => format!("{existing}{block}"),
                 None => block.trim_start().to_string(),
             });
         }
@@ -1605,61 +1923,56 @@ impl SchemaAnalyzer {
         })
     }
 
-    /// Collect human-readable notes for if/then/else conditions that will not
-    /// be enforced in generated Rust types.
+    /// Collect human-readable notes for if/then/else conditions that are not
+    /// lowered into generated Rust types.
     fn collect_dropped_conditionals(schema: &Schema) -> Vec<String> {
-        let mut notes = Vec::new();
         if matches!(schema, Schema::Boolean(_)) {
-            return notes;
+            return Vec::new();
         }
 
+        let mut notes = Vec::new();
         let details = schema.details();
         if details.if_schema.is_some() {
             notes.push(Self::format_if_then_note(details));
         }
 
-        // Sibling allOf on typed/untyped schemas (type + allOf: [{if,then}]).
         if let Some(all_of) = details.all_of.as_ref() {
-            for (i, branch) in all_of.iter().enumerate() {
-                notes.extend(Self::collect_dropped_conditionals_branch(branch, i));
+            for (index, branch) in all_of.iter().enumerate() {
+                notes.extend(Self::collect_dropped_conditionals_branch(branch, index));
             }
         }
-
-        // Pure Schema::AllOf composition.
         if let Schema::AllOf { all_of, .. } = schema {
-            for (i, branch) in all_of.iter().enumerate() {
-                notes.extend(Self::collect_dropped_conditionals_branch(branch, i));
+            for (index, branch) in all_of.iter().enumerate() {
+                notes.extend(Self::collect_dropped_conditionals_branch(branch, index));
             }
         }
-
         notes
     }
 
     fn collect_dropped_conditionals_branch(branch: &Schema, index: usize) -> Vec<String> {
-        let mut notes = Vec::new();
         if matches!(branch, Schema::Boolean(_)) {
-            return notes;
+            return Vec::new();
         }
+
+        let mut notes = Vec::new();
         let details = branch.details();
         if details.if_schema.is_some() {
-            let mut note = Self::format_if_then_note(details);
-            note = format!("allOf[{index}]: {note}");
-            notes.push(note);
+            notes.push(format!(
+                "allOf[{index}]: {}",
+                Self::format_if_then_note(details)
+            ));
         }
-        // Nested allOf is rare; one level of recursion covers real contracts.
         if let Some(nested) = details.all_of.as_ref() {
-            for (j, inner) in nested.iter().enumerate() {
-                for mut n in Self::collect_dropped_conditionals_branch(inner, j) {
-                    n = format!("allOf[{index}].{n}");
-                    notes.push(n);
+            for (nested_index, inner) in nested.iter().enumerate() {
+                for note in Self::collect_dropped_conditionals_branch(inner, nested_index) {
+                    notes.push(format!("allOf[{index}].{note}"));
                 }
             }
         }
         if let Schema::AllOf { all_of, .. } = branch {
-            for (j, inner) in all_of.iter().enumerate() {
-                for mut n in Self::collect_dropped_conditionals_branch(inner, j) {
-                    n = format!("allOf[{index}].{n}");
-                    notes.push(n);
+            for (nested_index, inner) in all_of.iter().enumerate() {
+                for note in Self::collect_dropped_conditionals_branch(inner, nested_index) {
+                    notes.push(format!("allOf[{index}].{note}"));
                 }
             }
         }
@@ -1670,59 +1983,65 @@ impl SchemaAnalyzer {
         let if_part = details
             .if_schema
             .as_ref()
-            .map(|s| Self::summarize_schema_for_note(s))
+            .map(|schema| Self::summarize_schema_for_note(schema))
             .unwrap_or_else(|| "true".to_string());
         let then_part = details
             .then_schema
             .as_ref()
-            .map(|s| Self::summarize_schema_for_note(s))
+            .map(|schema| Self::summarize_schema_for_note(schema))
             .unwrap_or_else(|| "{}".to_string());
         let else_part = details
             .else_schema
             .as_ref()
-            .map(|s| format!(" else {}", Self::summarize_schema_for_note(s)))
+            .map(|schema| format!(" else {}", Self::summarize_schema_for_note(schema)))
             .unwrap_or_default();
         format!("if {if_part} then {then_part}{else_part}")
     }
 
-    /// Compact one-line summary of a schema for conditional notes / warnings.
     fn summarize_schema_for_note(schema: &Schema) -> String {
         match schema {
-            Schema::Boolean(b) => b.to_string(),
+            Schema::Boolean(value) => value.to_string(),
             Schema::Reference { reference, .. } => format!("$ref:{reference}"),
             _ => {
-                let d = schema.details();
+                let details = schema.details();
                 let mut parts = Vec::new();
-                if let Some(req) = d.required.as_ref() {
-                    if !req.is_empty() {
-                        parts.push(format!("required=[{}]", req.join(", ")));
+                if let Some(required) = details.required.as_ref()
+                    && !required.is_empty()
+                {
+                    parts.push(format!("required=[{}]", required.join(", ")));
+                }
+                if let Some(properties) = details.properties.as_ref() {
+                    let property_notes = properties
+                        .iter()
+                        .map(|(name, property)| {
+                            format!("{name}:{}", Self::summarize_schema_for_note(property))
+                        })
+                        .collect::<Vec<_>>();
+                    if !property_notes.is_empty() {
+                        parts.push(format!("properties={{ {} }}", property_notes.join(", ")));
                     }
                 }
-                if let Some(props) = d.properties.as_ref() {
-                    let mut prop_bits = Vec::new();
-                    for (name, prop) in props {
-                        prop_bits.push(format!("{name}:{}", Self::summarize_schema_for_note(prop)));
-                    }
-                    if !prop_bits.is_empty() {
-                        parts.push(format!("properties={{ {} }}", prop_bits.join(", ")));
-                    }
+                if let Some(value) = details.const_value.as_ref() {
+                    parts.push(format!("const={value}"));
                 }
-                if let Some(c) = d.const_value.as_ref() {
-                    parts.push(format!("const={c}"));
-                }
-                if let Some(not) = d.not.as_ref() {
+                if let Some(not) = details.not.as_ref() {
                     parts.push(format!("not({})", Self::summarize_schema_for_note(not)));
                 }
-                if let Some(enums) = d.enum_values.as_ref() {
-                    let vals: Vec<String> = enums.iter().map(|v| v.to_string()).collect();
-                    parts.push(format!("enum=[{}]", vals.join(", ")));
+                if let Some(values) = details.enum_values.as_ref() {
+                    parts.push(format!(
+                        "enum=[{}]",
+                        values
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
                 }
                 if parts.is_empty() {
-                    if let Some(t) = schema.schema_type() {
-                        format!("type={t:?}")
-                    } else {
-                        "{}".to_string()
-                    }
+                    schema
+                        .schema_type()
+                        .map(|schema_type| format!("type={schema_type:?}"))
+                        .unwrap_or_else(|| "{}".to_string())
                 } else {
                     parts.join(" ")
                 }
@@ -1747,8 +2066,8 @@ impl SchemaAnalyzer {
 
         if let Some(props) = properties {
             for (prop_name, prop_schema) in props {
-                // JSON Schema boolean property schemas: `false` forbids the
-                // key, `true` accepts any value.
+                // A boolean `false` property schema forbids the key; `true`
+                // accepts any JSON value.
                 if matches!(prop_schema, Schema::Boolean(false)) {
                     continue;
                 }
@@ -1771,7 +2090,6 @@ impl SchemaAnalyzer {
                     );
                     continue;
                 }
-
                 // Check if this property is a union that needs a named type
                 let prop_type = if let Schema::AnyOf { any_of, .. } = prop_schema {
                     // First check if this should be a dynamic JSON pattern
@@ -1959,8 +2277,8 @@ impl SchemaAnalyzer {
                 };
 
                 let prop_details = prop_schema.details();
-                // Check for both explicit nullable and anyOf nullable patterns
-                let prop_nullable = prop_details.is_nullable() || prop_schema.is_nullable_pattern();
+                // Every nullability form, via one helper — see is_nullable_any.
+                let prop_nullable = prop_schema.is_nullable_any();
                 let prop_description = prop_details.description.clone();
                 let prop_default = prop_details.default.clone();
 
@@ -2090,108 +2408,12 @@ impl SchemaAnalyzer {
                             format!("{context_name}{suffix}")
                         };
 
-                        // Resolve a name that either matches an existing same-valued
-                        // enum (dedup) or doesn't collide with a different one.
-                        //
-                        // Two distinct inline enums can land on the same primary
-                        // candidate when a parent schema has a property like
-                        // `type` that recurs at multiple nesting levels — e.g.
-                        // Latitude.sh's `plan_data.type = ["plans"]` (the
-                        // JSON-API resource type) and
-                        // `plan_data.attributes.specs.drives[].type =
-                        // ["SSD","HDD","NVME"]` both want to become
-                        // `PlanDataType`. We must NOT silently overwrite the
-                        // first registration: that breaks deserialization
-                        // because both fields end up referencing whichever
-                        // enum was processed last.
-                        //
-                        // Disambiguation strategy: append the PascalCase first
-                        // enum value (`PlanDataTypeNVME` vs `PlanDataTypePlans`)
-                        // and, if that's also claimed with different values,
-                        // fall back to a numeric `_2`, `_3`, … suffix.
-                        fn matches_values(existing: &AnalyzedSchema, values: &[String]) -> bool {
-                            matches!(
-                                &existing.schema_type,
-                                SchemaType::StringEnum { values: existing_values }
-                                    if existing_values == values
-                            )
-                        }
-
-                        let mut enum_type_name = primary_name.clone();
-                        let mut should_insert = match self.resolved_cache.get(&enum_type_name) {
-                            None => true,
-                            Some(existing) if matches_values(existing, &enum_values) => false,
-                            Some(_) => {
-                                // Collision with different values — try a
-                                // value-suffixed name first.
-                                let suffix = enum_values
-                                    .first()
-                                    .map(|v| self.to_pascal_case(v))
-                                    .unwrap_or_else(|| "Variant".to_string());
-                                let candidate = format!("{primary_name}{suffix}");
-
-                                let resolved = match self.resolved_cache.get(&candidate) {
-                                    None => Some((candidate.clone(), true)),
-                                    Some(existing) if matches_values(existing, &enum_values) => {
-                                        Some((candidate.clone(), false))
-                                    }
-                                    Some(_) => {
-                                        // Walk a numeric suffix until we find
-                                        // a slot that's free or matches.
-                                        let mut found = None;
-                                        for n in 2..1000 {
-                                            let numbered = format!("{candidate}_{n}");
-                                            match self.resolved_cache.get(&numbered) {
-                                                None => {
-                                                    found = Some((numbered, true));
-                                                    break;
-                                                }
-                                                Some(existing)
-                                                    if matches_values(existing, &enum_values) =>
-                                                {
-                                                    found = Some((numbered, false));
-                                                    break;
-                                                }
-                                                Some(_) => continue,
-                                            }
-                                        }
-                                        found
-                                    }
-                                };
-
-                                let (resolved_name, insert) = resolved.unwrap_or((candidate, true));
-                                enum_type_name = resolved_name;
-                                insert
-                            }
-                        };
-
-                        // Store the enum as a named schema if this is the
-                        // first time we've seen this exact (name, values) pair.
-                        if should_insert {
-                            self.resolved_cache.insert(
-                                enum_type_name.clone(),
-                                AnalyzedSchema {
-                                    name: enum_type_name.clone(),
-                                    original: serde_json::to_value(schema).unwrap_or(Value::Null),
-                                    schema_type: SchemaType::StringEnum {
-                                        values: enum_values,
-                                    },
-                                    dependencies: HashSet::new(),
-                                    nullable: false,
-                                    description: schema.details().description.clone(),
-                                    default: schema.details().default.clone(),
-                                },
-                            );
-                            // Silence unused-write warnings when the value
-                            // is not consulted again on this path.
-                            let _ = &mut should_insert;
-                        }
-
-                        // Return a reference to the named enum type
-                        dependencies.insert(enum_type_name.clone());
-                        return Ok(SchemaType::Reference {
-                            target: enum_type_name,
-                        });
+                        return Ok(self.hoist_inline_string_enum(
+                            schema,
+                            enum_values,
+                            primary_name,
+                            dependencies,
+                        ));
                     } else {
                         // Property-level string with no enum values:
                         // route through TypeMapper so `format: date-time`
@@ -2485,17 +2707,46 @@ impl SchemaAnalyzer {
         all_of_schemas: &[Schema],
         dependencies: &mut HashSet<String>,
     ) -> Result<SchemaType> {
-        // Special case: if allOf contains only a single reference, treat it as a direct type alias
-        // This handles patterns like: "allOf": [{"$ref": "#/components/schemas/Usage"}]
-        if all_of_schemas.len() == 1 {
-            if let Schema::Reference { reference, .. } = &all_of_schemas[0] {
-                if let Some(target) = self.extract_schema_name(reference) {
-                    dependencies.insert(target.to_string());
-                    return Ok(SchemaType::Reference {
-                        target: target.to_string(),
-                    });
-                }
+        // A reference plus annotation-only siblings is still a direct type
+        // alias. AWS-style specs frequently encode property descriptions as
+        // `allOf: [$ref, { description: ... }]`; recursively expanding a
+        // self-reference in that shape can otherwise recurse forever.
+        let referenced_targets = all_of_schemas
+            .iter()
+            .filter_map(|schema| schema.reference())
+            .filter_map(|reference| self.extract_schema_name(reference))
+            .collect::<Vec<_>>();
+        let only_reference_and_annotations = all_of_schemas.iter().all(|schema| {
+            if schema.reference().is_some() {
+                return true;
             }
+            serde_json::to_value(schema)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "title"
+                                | "description"
+                                | "deprecated"
+                                | "readOnly"
+                                | "writeOnly"
+                                | "examples"
+                                | "example"
+                                | "externalDocs"
+                                | "xml"
+                                | "$comment"
+                        ) || key.starts_with("x-")
+                    })
+                })
+        });
+        if referenced_targets.len() == 1 && only_reference_and_annotations {
+            let target = referenced_targets[0];
+            dependencies.insert(target.to_string());
+            return Ok(SchemaType::Reference {
+                target: target.to_string(),
+            });
         }
 
         // AllOf represents schema composition - merge all schemas into one
@@ -2507,16 +2758,16 @@ impl SchemaAnalyzer {
         let current_context = self.current_schema_name.clone();
 
         for schema in all_of_schemas {
-            // Pure if/then branches contribute no unconditional properties/
-            // required; they are recorded as doc/warnings at the parent.
+            // Conditional-only branches contribute validation policy, not
+            // unconditional object fields. Their contract is documented on
+            // the parent schema by `collect_dropped_conditionals`.
             if schema.is_conditional_only() {
                 continue;
             }
-
             match schema {
                 Schema::Boolean(_) => {
-                    // Boolean schemas in allOf: true is a no-op, false makes
-                    // the composition unsatisfiable. Skip both for merge.
+                    // `true` is a no-op; `false` makes the JSON Schema
+                    // unsatisfiable but has no useful Rust shape to merge.
                 }
                 Schema::Reference { reference, .. } => {
                     // Add dependency on referenced schema
@@ -2641,13 +2892,10 @@ impl SchemaAnalyzer {
         // Merge properties
         if let Some(properties) = &details.properties {
             for (prop_name, prop_schema) in properties {
-                // Boolean false property schema means "this property must not
-                // validate" (JSON Schema forbid). Skip emitting a field.
                 if matches!(prop_schema, Schema::Boolean(false)) {
                     continue;
                 }
                 if matches!(prop_schema, Schema::Boolean(true)) {
-                    // Accept any value: model as open JSON.
                     merged_properties.insert(
                         prop_name.clone(),
                         PropertyInfo {
@@ -2666,7 +2914,6 @@ impl SchemaAnalyzer {
                     );
                     continue;
                 }
-
                 let prop_type = self.analyze_property_schema_with_context(
                     prop_schema,
                     Some(prop_name),
@@ -2674,12 +2921,13 @@ impl SchemaAnalyzer {
                 )?;
                 let prop_details = prop_schema.details();
 
-                // Bug openapi-generator-bgo: pick up 3.1-style nullability
-                // (anyOf/oneOf with a `type: null` branch) in addition to the
-                // 3.0 `nullable: true` keyword. Without this, properties merged
-                // through allOf composition lose their null-branch detection
-                // (real hit: OpenAI Response.incomplete_details).
-                let nullable = prop_details.is_nullable() || prop_schema.is_nullable_pattern();
+                // Properties merged through allOf composition must go through
+                // the same nullability check as plain object properties.
+                // Real hits: OpenAI Response.incomplete_details (anyOf-with-null,
+                // openapi-generator-bgo) and RunPod Pod.startedAt / Pod.template
+                // (3.1 type-array, openapi-generator-dsu) — the latter arrive
+                // as `null` from the live API for any pod that hasn't started.
+                let nullable = prop_schema.is_nullable_any();
                 merged_properties.insert(
                     prop_name.clone(),
                     PropertyInfo {
@@ -2694,15 +2942,16 @@ impl SchemaAnalyzer {
             }
         }
 
-        // Merge required fields (unconditional only; then.required is never
-        // promoted into the merged set).
+        // Merge required fields
         if let Some(required) = &details.required {
             for field in required {
                 merged_required.insert(field.clone());
             }
         }
 
-        // Sibling allOf on a typed object: merge non-conditional branches.
+        // Mixed object schemas can carry sibling allOf branches. Merge only
+        // structural branches; conditional-only branches remain documentation
+        // and runtime-validation concerns.
         if let Some(all_of) = details.all_of.as_ref() {
             for branch in all_of {
                 if branch.is_conditional_only() || matches!(branch, Schema::Boolean(_)) {
@@ -3688,6 +3937,116 @@ impl SchemaAnalyzer {
         }
     }
 
+    /// Register an inline string enum as a named `StringEnum` schema and
+    /// return a `Reference` to it. Shared by property-level enums
+    /// (`{Schema}{Prop}`) and array-item enums (`{Schema}{Prop}Item`).
+    ///
+    /// Resolves a name that either matches an existing same-valued
+    /// enum (dedup) or doesn't collide with a different one.
+    ///
+    /// Two distinct inline enums can land on the same primary
+    /// candidate when a parent schema has a property like
+    /// `type` that recurs at multiple nesting levels — e.g.
+    /// Latitude.sh's `plan_data.type = ["plans"]` (the
+    /// JSON-API resource type) and
+    /// `plan_data.attributes.specs.drives[].type =
+    /// ["SSD","HDD","NVME"]` both want to become
+    /// `PlanDataType`. We must NOT silently overwrite the
+    /// first registration: that breaks deserialization
+    /// because both fields end up referencing whichever
+    /// enum was processed last.
+    ///
+    /// Disambiguation strategy: append the PascalCase first
+    /// enum value (`PlanDataTypeNVME` vs `PlanDataTypePlans`)
+    /// and, if that's also claimed with different values,
+    /// fall back to a numeric `_2`, `_3`, … suffix.
+    fn hoist_inline_string_enum(
+        &mut self,
+        schema: &Schema,
+        enum_values: Vec<String>,
+        primary_name: String,
+        dependencies: &mut HashSet<String>,
+    ) -> SchemaType {
+        fn matches_values(existing: &AnalyzedSchema, values: &[String]) -> bool {
+            matches!(
+                &existing.schema_type,
+                SchemaType::StringEnum { values: existing_values }
+                    if existing_values == values
+            )
+        }
+
+        let mut enum_type_name = primary_name.clone();
+        let should_insert = match self.resolved_cache.get(&enum_type_name) {
+            None => true,
+            Some(existing) if matches_values(existing, &enum_values) => false,
+            Some(_) => {
+                // Collision with different values — try a
+                // value-suffixed name first.
+                let suffix = enum_values
+                    .first()
+                    .map(|v| self.to_pascal_case(v))
+                    .unwrap_or_else(|| "Variant".to_string());
+                let candidate = format!("{primary_name}{suffix}");
+
+                let resolved = match self.resolved_cache.get(&candidate) {
+                    None => Some((candidate.clone(), true)),
+                    Some(existing) if matches_values(existing, &enum_values) => {
+                        Some((candidate.clone(), false))
+                    }
+                    Some(_) => {
+                        // Walk a numeric suffix until we find
+                        // a slot that's free or matches.
+                        let mut found = None;
+                        for n in 2..1000 {
+                            let numbered = format!("{candidate}_{n}");
+                            match self.resolved_cache.get(&numbered) {
+                                None => {
+                                    found = Some((numbered, true));
+                                    break;
+                                }
+                                Some(existing) if matches_values(existing, &enum_values) => {
+                                    found = Some((numbered, false));
+                                    break;
+                                }
+                                Some(_) => continue,
+                            }
+                        }
+                        found
+                    }
+                };
+
+                let (resolved_name, insert) = resolved.unwrap_or((candidate, true));
+                enum_type_name = resolved_name;
+                insert
+            }
+        };
+
+        // Store the enum as a named schema if this is the
+        // first time we've seen this exact (name, values) pair.
+        if should_insert {
+            self.resolved_cache.insert(
+                enum_type_name.clone(),
+                AnalyzedSchema {
+                    name: enum_type_name.clone(),
+                    original: serde_json::to_value(schema).unwrap_or(Value::Null),
+                    schema_type: SchemaType::StringEnum {
+                        values: enum_values,
+                    },
+                    dependencies: HashSet::new(),
+                    nullable: false,
+                    description: schema.details().description.clone(),
+                    default: schema.details().default.clone(),
+                },
+            );
+        }
+
+        // Return a reference to the named enum type
+        dependencies.insert(enum_type_name.clone());
+        SchemaType::Reference {
+            target: enum_type_name,
+        }
+    }
+
     fn analyze_array_schema(
         &mut self,
         schema: &Schema,
@@ -3700,10 +4059,6 @@ impl SchemaAnalyzer {
         if let Some(items_schema) = &details.items {
             // Analyze the item type
             let item_type = match items_schema.as_ref() {
-                Schema::Boolean(_) => SchemaType::Primitive {
-                    rust_type: "serde_json::Value".to_string(),
-                    serde_with: None,
-                },
                 Schema::Reference { reference, .. } => {
                     // Array of referenced types
                     let target = self
@@ -3734,10 +4089,27 @@ impl SchemaAnalyzer {
                 Schema::Typed { schema_type, .. } => {
                     // Array of primitive types
                     match schema_type {
-                        OpenApiSchemaType::String => SchemaType::Primitive {
-                            rust_type: "String".to_string(),
-                            serde_with: None,
-                        },
+                        OpenApiSchemaType::String => {
+                            // Inline string enum in array items — hoist to a
+                            // named enum (`{Parent}Item`) instead of collapsing
+                            // to `Vec<String>`.
+                            match items_schema
+                                .details()
+                                .string_enum_values()
+                                .filter(|values| !values.is_empty())
+                            {
+                                Some(values) => self.hoist_inline_string_enum(
+                                    items_schema,
+                                    values,
+                                    format!("{parent_schema_name}Item"),
+                                    dependencies,
+                                ),
+                                None => SchemaType::Primitive {
+                                    rust_type: "String".to_string(),
+                                    serde_with: None,
+                                },
+                            }
+                        }
                         OpenApiSchemaType::Integer | OpenApiSchemaType::Number => {
                             let details = items_schema.details();
                             let rust_type = self.get_number_rust_type(schema_type.clone(), details);
@@ -3854,10 +4226,26 @@ impl SchemaAnalyzer {
                                     target: object_type_name,
                                 }
                             }
-                            OpenApiSchemaType::String => SchemaType::Primitive {
-                                rust_type: "String".to_string(),
-                                serde_with: None,
-                            },
+                            OpenApiSchemaType::String => {
+                                // Typeless (OpenAPI 3.1) enum in array items —
+                                // same hoisting as the typed-string arm.
+                                match items_schema
+                                    .details()
+                                    .string_enum_values()
+                                    .filter(|values| !values.is_empty())
+                                {
+                                    Some(values) => self.hoist_inline_string_enum(
+                                        items_schema,
+                                        values,
+                                        format!("{parent_schema_name}Item"),
+                                        dependencies,
+                                    ),
+                                    None => SchemaType::Primitive {
+                                        rust_type: "String".to_string(),
+                                        serde_with: None,
+                                    },
+                                }
+                            }
                             OpenApiSchemaType::Integer | OpenApiSchemaType::Number => {
                                 let details = items_schema.details();
                                 let rust_type = self.get_number_rust_type(inferred, details);
@@ -4318,13 +4706,18 @@ impl SchemaAnalyzer {
     fn analyze_operations(&mut self, analysis: &mut SchemaAnalysis) -> Result<()> {
         let spec: crate::openapi::OpenApiSpec = serde_json::from_value(self.openapi_spec.clone())
             .map_err(GeneratorError::ParseError)?;
+        // Operation IDs are emitted into one Rust module, so collision
+        // detection spans paths and webhooks. Index their canonical Rust type
+        // names once instead of re-canonicalizing every previously analyzed
+        // operation for every new endpoint.
+        let mut canonical_operation_ids = HashSet::new();
 
         if let Some(paths) = &spec.paths {
             for (path, path_item) in paths {
                 // H11: Path Item may be a $ref to components/pathItems. Resolve here.
                 let resolved = self.resolve_path_item(path_item, &spec)?;
                 let pi: &crate::openapi::PathItem = resolved.as_ref().unwrap_or(path_item);
-                self.ingest_path_item_operations(path, pi, analysis)?;
+                self.ingest_path_item_operations(path, pi, analysis, &mut canonical_operation_ids)?;
             }
         }
         // T4: walk webhooks the same way as paths. Per OAS 3.1+, webhooks are
@@ -4335,8 +4728,13 @@ impl SchemaAnalyzer {
         // dispatcher.
         if let Some(webhooks) = &spec.webhooks {
             for (name, path_item) in webhooks {
-                let synthetic_path = format!("__webhook__/{name}");
-                self.ingest_path_item_operations(&synthetic_path, path_item, analysis)?;
+                let synthetic_path = format!("/__webhook__/{name}");
+                self.ingest_path_item_operations(
+                    &synthetic_path,
+                    path_item,
+                    analysis,
+                    &mut canonical_operation_ids,
+                )?;
             }
         }
         Ok(())
@@ -4378,6 +4776,7 @@ impl SchemaAnalyzer {
         path: &str,
         path_item: &crate::openapi::PathItem,
         analysis: &mut SchemaAnalysis,
+        canonical_operation_ids: &mut HashSet<String>,
     ) -> Result<()> {
         for (method, operation) in path_item.operations() {
             // Generate operation ID if missing.
@@ -4396,20 +4795,13 @@ impl SchemaAnalyzer {
             // `GetMdrUsageReports`) collide too — otherwise codegen would
             // produce two `GetMdrUsageReportsApiError` enums in the same
             // module.
-            use heck::ToPascalCase;
-            let canon = |s: &str| s.replace('.', "_").to_pascal_case();
-            let key_collides = |id: &str| -> bool {
-                let target = canon(id);
-                analysis
-                    .operations
-                    .keys()
-                    .any(|existing| canon(existing) == target)
-            };
-            let operation_id = if key_collides(&raw_operation_id) {
+            let operation_id = if canonical_operation_ids
+                .contains(&Self::canonical_operation_id(&raw_operation_id))
+            {
                 let method_lower = method.to_lowercase();
                 let mut candidate = format!("{}_{}", raw_operation_id, method_lower);
                 let mut suffix = 2;
-                while key_collides(&candidate) {
+                while canonical_operation_ids.contains(&Self::canonical_operation_id(&candidate)) {
                     candidate = format!("{}_{}_{}", raw_operation_id, method_lower, suffix);
                     suffix += 1;
                 }
@@ -4419,10 +4811,10 @@ impl SchemaAnalyzer {
                 );
                 candidate
             } else {
-                raw_operation_id
+                raw_operation_id.clone()
             };
 
-            let op_info = self.analyze_single_operation(
+            let (op_info, responses) = self.analyze_single_operation(
                 &operation_id,
                 method,
                 path,
@@ -4430,9 +4822,23 @@ impl SchemaAnalyzer {
                 path_item.parameters.as_ref(),
                 analysis,
             )?;
+            analysis
+                .operation_id_aliases
+                .entry(raw_operation_id)
+                .or_default()
+                .push(operation_id.clone());
+            canonical_operation_ids.insert(Self::canonical_operation_id(&operation_id));
+            analysis
+                .operation_responses
+                .insert(operation_id.clone(), responses);
             analysis.operations.insert(operation_id, op_info);
         }
         Ok(())
+    }
+
+    fn canonical_operation_id(operation_id: &str) -> String {
+        use heck::ToPascalCase;
+        operation_id.replace('.', "_").to_pascal_case()
     }
 
     /// Generate an operation ID from method and path when not provided
@@ -4483,17 +4889,30 @@ impl SchemaAnalyzer {
         operation: &crate::openapi::Operation,
         path_item_parameters: Option<&Vec<crate::openapi::Parameter>>,
         _analysis: &mut SchemaAnalysis,
-    ) -> Result<OperationInfo> {
+    ) -> Result<(OperationInfo, BTreeMap<String, OperationResponse>)> {
+        let raw_path_item = self
+            .openapi_spec
+            .get("paths")
+            .and_then(|paths| paths.get(path))
+            .cloned();
+        let raw_operation = raw_path_item
+            .as_ref()
+            .and_then(|path_item| path_item.get(method.to_ascii_lowercase()))
+            .cloned();
+        let request_body = operation
+            .request_body
+            .as_ref()
+            .map(|request_body| self.resolve_request_body(request_body))
+            .transpose()?;
         let mut op_info = OperationInfo {
             operation_id: operation_id.to_string(),
             method: method.to_uppercase(),
-            path: path.to_string(),
+            path: normalize_operation_path(path),
             summary: operation.summary.clone(),
             description: operation.description.clone(),
             request_body: None,
             // Per OAS 3.x §"Request Body Object", `required` defaults to false.
-            request_body_required: operation
-                .request_body
+            request_body_required: request_body
                 .as_ref()
                 .and_then(|rb| rb.required)
                 .unwrap_or(false),
@@ -4503,58 +4922,157 @@ impl SchemaAnalyzer {
             stream_parameter: None,    // Will be determined by StreamingConfig, not spec
             tags: operation.tags.clone().unwrap_or_default(),
         };
+        let mut operation_responses = BTreeMap::new();
 
         // Extract request body schema with content-type awareness
-        if let Some(request_body) = &operation.request_body
-            && let Some((content_type, maybe_schema)) = request_body.best_content()
-        {
-            use crate::openapi::{is_form_urlencoded_media_type, is_json_media_type};
-            op_info.request_body = if is_json_media_type(content_type) {
-                maybe_schema
-                    .map(|s| {
-                        self.resolve_or_inline_schema(s, operation_id, "Request")
-                            .map(|name| RequestBodyContent::Json { schema_name: name })
-                    })
-                    .transpose()?
-            } else if is_form_urlencoded_media_type(content_type) {
-                maybe_schema
-                    .map(|s| {
-                        self.resolve_or_inline_schema(s, operation_id, "Request")
-                            .map(|name| RequestBodyContent::FormUrlEncoded { schema_name: name })
-                    })
-                    .transpose()?
-            } else {
-                match content_type {
-                    "multipart/form-data" => Some(RequestBodyContent::Multipart),
-                    "application/octet-stream" => Some(RequestBodyContent::OctetStream),
-                    "text/plain" => Some(RequestBodyContent::TextPlain),
-                    _ => None,
-                }
+        if let Some(request_body) = &request_body {
+            use crate::openapi::{
+                is_binary_media_type, is_form_urlencoded_media_type, is_json_media_type,
+                media_type_essence,
             };
+            if let Some((content_type, maybe_schema)) = request_body.best_content() {
+                op_info.request_body = if is_json_media_type(content_type) {
+                    match maybe_schema {
+                        Some(s) => {
+                            let validation_schema = self
+                                .raw_request_body_schema(raw_operation.as_ref(), content_type)
+                                .unwrap_or(
+                                    serde_json::to_value(s).map_err(GeneratorError::ParseError)?,
+                                );
+                            Some(
+                                self.resolve_or_inline_schema(s, operation_id, "Request")
+                                    .map(|name| RequestBodyContent::Json {
+                                        schema_name: name,
+                                        media_type: content_type.to_string(),
+                                        validation_schema,
+                                    })?,
+                            )
+                        }
+                        None => Some(RequestBodyContent::SchemaLess {
+                            media_type: content_type.to_string(),
+                        }),
+                    }
+                } else if is_form_urlencoded_media_type(content_type) {
+                    match maybe_schema {
+                        Some(s) => {
+                            let validation_schema = self
+                                .raw_request_body_schema(raw_operation.as_ref(), content_type)
+                                .unwrap_or(
+                                    serde_json::to_value(s).map_err(GeneratorError::ParseError)?,
+                                );
+                            Some(
+                                self.resolve_or_inline_schema(s, operation_id, "Request")
+                                    .map(|name| RequestBodyContent::FormUrlEncoded {
+                                        schema_name: name,
+                                        media_type: content_type.to_string(),
+                                        validation_schema,
+                                    })?,
+                            )
+                        }
+                        None => Some(RequestBodyContent::SchemaLess {
+                            media_type: content_type.to_string(),
+                        }),
+                    }
+                } else if media_type_essence(content_type)
+                    .eq_ignore_ascii_case("multipart/form-data")
+                {
+                    match maybe_schema {
+                        Some(schema) => {
+                            let validation_schema = self
+                                .raw_request_body_schema(raw_operation.as_ref(), content_type)
+                                .unwrap_or(
+                                    serde_json::to_value(schema)
+                                        .map_err(GeneratorError::ParseError)?,
+                                );
+                            Some(
+                                self.resolve_or_inline_schema(schema, operation_id, "Request")
+                                    .map(|schema_name| RequestBodyContent::Multipart {
+                                        schema_name,
+                                        media_type: content_type.to_string(),
+                                        validation_schema,
+                                    })?,
+                            )
+                        }
+                        None => Some(RequestBodyContent::SchemaLess {
+                            media_type: content_type.to_string(),
+                        }),
+                    }
+                } else if is_binary_media_type(content_type, maybe_schema) {
+                    if media_type_essence(content_type)
+                        .eq_ignore_ascii_case("application/octet-stream")
+                    {
+                        Some(RequestBodyContent::OctetStream {
+                            media_type: content_type.to_string(),
+                        })
+                    } else {
+                        Some(RequestBodyContent::Binary {
+                            media_type: content_type.to_string(),
+                        })
+                    }
+                } else if crate::openapi::is_text_media_type(content_type) {
+                    // Any character-data media type (text/plain, text/xml,
+                    // application/xml, +xml suffixed) is buffered and handed
+                    // to the handler as a lossless UTF-8 String; the server
+                    // never parses the payload.
+                    Some(RequestBodyContent::TextPlain {
+                        media_type: content_type.to_string(),
+                    })
+                } else {
+                    None
+                };
+            }
+            if op_info.request_body.is_none() {
+                let mut media_types = request_body
+                    .content
+                    .as_ref()
+                    .map(|content| content.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                media_types.sort();
+                if !media_types.is_empty() {
+                    op_info.request_body = Some(RequestBodyContent::Unsupported { media_types });
+                }
+            }
         }
 
         // Extract response schemas
         if let Some(responses) = &operation.responses {
             for (status_code, response) in responses {
-                let response = self.resolve_response(response).into_owned();
+                let response = self.resolve_response(response)?;
                 // T15: SSE auto-detection. If any response declares
                 // `text/event-stream`, mark the operation as streaming. The
                 // user can still override via config; here we lift the spec
                 // signal so a `stream: true` parameter and an event-stream
                 // content type produce a streaming variant by default.
-                if let Some(content) = response.content.as_ref() {
-                    if content.keys().any(|ct| ct.starts_with("text/event-stream")) {
-                        op_info.supports_streaming = true;
-                    }
+                let supports_streaming = response.content.as_ref().is_some_and(|content| {
+                    content
+                        .keys()
+                        .any(|ct| crate::openapi::is_event_stream_media_type(ct))
+                });
+                if supports_streaming {
+                    op_info.supports_streaming = true;
                 }
 
-                if let Some(schema) = response.json_schema() {
+                let mut response_info = OperationResponse {
+                    supports_streaming,
+                    has_content: response
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| !content.is_empty()),
+                    ..Default::default()
+                };
+                if let Some((media_type, schema)) = response.json_content() {
                     if let Some(schema_ref) = schema.reference() {
                         // Named schema reference
                         if let Some(schema_name) = self.extract_schema_name(schema_ref) {
                             op_info
                                 .response_schemas
                                 .insert(status_code.clone(), schema_name.to_string());
+                            response_info.schema_name = Some(schema_name.to_string());
+                            response_info.media_type = Some(media_type.to_string());
+                            response_info.body = Some(OperationResponseBody::Json {
+                                schema_name: schema_name.to_string(),
+                                media_type: media_type.to_string(),
+                            });
                         }
                     } else {
                         // Inline schema - generate a synthetic type name and analyze it
@@ -4567,9 +5085,91 @@ impl SchemaAnalyzer {
 
                         op_info
                             .response_schemas
-                            .insert(status_code.clone(), synthetic_name);
+                            .insert(status_code.clone(), synthetic_name.clone());
+                        response_info.body = Some(OperationResponseBody::Json {
+                            schema_name: synthetic_name.clone(),
+                            media_type: media_type.to_string(),
+                        });
+                        response_info.schema_name = Some(synthetic_name);
+                        response_info.media_type = Some(media_type.to_string());
                     }
                 }
+                if response_info.body.is_none()
+                    && let Some(content) = response.content.as_ref()
+                {
+                    let selected = content
+                        .iter()
+                        .find(|(media_type, media)| {
+                            matches!(
+                                crate::openapi::classify_response_media_type(
+                                    media_type,
+                                    media.schema.as_ref()
+                                ),
+                                crate::openapi::ResponseMediaKind::Text
+                            )
+                        })
+                        .or_else(|| {
+                            content.iter().find(|(media_type, media)| {
+                                matches!(
+                                    crate::openapi::classify_response_media_type(
+                                        media_type,
+                                        media.schema.as_ref()
+                                    ),
+                                    crate::openapi::ResponseMediaKind::Binary
+                                ) && !crate::openapi::is_wildcard_media_type(media_type)
+                            })
+                        })
+                        .or_else(|| {
+                            content.iter().find(|(media_type, media)| {
+                                matches!(
+                                    crate::openapi::classify_response_media_type(
+                                        media_type,
+                                        media.schema.as_ref()
+                                    ),
+                                    crate::openapi::ResponseMediaKind::Binary
+                                )
+                            })
+                        });
+                    if let Some((media_type, media)) = selected {
+                        response_info.body = match crate::openapi::classify_response_media_type(
+                            media_type,
+                            media.schema.as_ref(),
+                        ) {
+                            crate::openapi::ResponseMediaKind::Text => {
+                                Some(OperationResponseBody::Text {
+                                    media_type: media_type.clone(),
+                                })
+                            }
+                            crate::openapi::ResponseMediaKind::Binary => {
+                                Some(OperationResponseBody::Binary {
+                                    media_type: media_type.clone(),
+                                    wildcard: crate::openapi::is_wildcard_media_type(media_type),
+                                })
+                            }
+                            _ => None,
+                        };
+                    }
+                }
+                response_info.unsupported_media_types = response
+                    .content
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|content| content.iter())
+                    .filter(|(media_type, content)| {
+                        match crate::openapi::classify_response_media_type(
+                            media_type,
+                            content.schema.as_ref(),
+                        ) {
+                            crate::openapi::ResponseMediaKind::Json => content.schema.is_none(),
+                            crate::openapi::ResponseMediaKind::Unsupported => true,
+                            crate::openapi::ResponseMediaKind::EventStream
+                            | crate::openapi::ResponseMediaKind::Text
+                            | crate::openapi::ResponseMediaKind::Binary => false,
+                        }
+                    })
+                    .map(|(media_type, _)| media_type.clone())
+                    .collect();
+                operation_responses.insert(status_code.clone(), response_info);
             }
         }
 
@@ -4590,9 +5190,20 @@ impl SchemaAnalyzer {
 
         // Extract parameters (operation-level first, then merge path-item-level)
         if let Some(parameters) = &operation.parameters {
-            for param in parameters {
-                let resolved = self.resolve_parameter(param);
-                if let Some(param_info) = self.analyze_parameter(&resolved, operation_id)? {
+            for (index, param) in parameters.iter().enumerate() {
+                // into_owned: analyze_parameter needs `&mut self` (it may
+                // register an inline object schema for form-exploded query
+                // params), which can't coexist with the Cow's `&self` borrow.
+                let resolved = self.resolve_parameter(param).into_owned();
+                let validation_schema = raw_operation
+                    .as_ref()
+                    .and_then(|operation| operation.get("parameters"))
+                    .and_then(Value::as_array)
+                    .and_then(|parameters| parameters.get(index))
+                    .and_then(|parameter| self.raw_parameter_schema(parameter));
+                if let Some(param_info) =
+                    self.analyze_parameter(&resolved, operation_id, validation_schema)?
+                {
                     op_info.parameters.push(param_info);
                 }
             }
@@ -4605,9 +5216,17 @@ impl SchemaAnalyzer {
                 .iter()
                 .map(|p| (p.name.clone(), p.location.clone()))
                 .collect();
-            for param in path_params {
-                let resolved = self.resolve_parameter(param);
-                if let Some(param_info) = self.analyze_parameter(&resolved, operation_id)? {
+            for (index, param) in path_params.iter().enumerate() {
+                let resolved = self.resolve_parameter(param).into_owned();
+                let validation_schema = raw_path_item
+                    .as_ref()
+                    .and_then(|path_item| path_item.get("parameters"))
+                    .and_then(Value::as_array)
+                    .and_then(|parameters| parameters.get(index))
+                    .and_then(|parameter| self.raw_parameter_schema(parameter));
+                if let Some(param_info) =
+                    self.analyze_parameter(&resolved, operation_id, validation_schema)?
+                {
                     if !existing_keys
                         .contains(&(param_info.name.clone(), param_info.location.clone()))
                     {
@@ -4664,7 +5283,10 @@ impl SchemaAnalyzer {
                 rust_type: "String".to_string(),
                 description: None,
                 enum_values: None,
+                enum_varnames: None,
                 rust_ident: None,
+                query_serialization: None,
+                validation_schema: None,
             });
         }
 
@@ -4687,7 +5309,114 @@ impl SchemaAnalyzer {
             p.rust_ident = Some(chosen);
         }
 
-        Ok(op_info)
+        Ok((op_info, operation_responses))
+    }
+
+    /// Resolve a local reusable Request Body Object through its JSON Pointer.
+    fn resolve_request_body(
+        &self,
+        request_body: &crate::openapi::RequestBody,
+    ) -> Result<crate::openapi::RequestBody> {
+        let mut current = request_body.clone();
+        let mut visited = HashSet::new();
+        while let Some(reference) = current.reference.clone() {
+            if !visited.insert(reference.clone()) {
+                return Err(GeneratorError::CircularDependency(format!(
+                    "request body reference {reference}"
+                )));
+            }
+
+            let pointer = reference.strip_prefix('#').ok_or_else(|| {
+                GeneratorError::UnresolvedReference(format!(
+                    "external request body reference `{reference}` is not supported"
+                ))
+            })?;
+            if !pointer.is_empty() && !pointer.starts_with('/') {
+                return Err(GeneratorError::UnresolvedReference(format!(
+                    "request body reference `{reference}` is not a local JSON Pointer"
+                )));
+            }
+            let value = self.openapi_spec.pointer(pointer).ok_or_else(|| {
+                GeneratorError::UnresolvedReference(format!(
+                    "request body reference `{reference}` does not exist"
+                ))
+            })?;
+            let object = value.as_object().ok_or_else(|| {
+                GeneratorError::InvalidSchema(format!(
+                    "request body reference `{reference}` must target an object"
+                ))
+            })?;
+            if !["$ref", "description", "required", "content"]
+                .iter()
+                .any(|field| object.contains_key(*field))
+            {
+                return Err(GeneratorError::InvalidSchema(format!(
+                    "request body reference `{reference}` does not target a structurally compatible OpenAPI Request Body Object"
+                )));
+            }
+            current = serde_json::from_value(value.clone()).map_err(|error| {
+                GeneratorError::InvalidSchema(format!(
+                    "request body reference `{reference}` is not a valid OpenAPI Request Body Object: {error}"
+                ))
+            })?;
+        }
+        Ok(current)
+    }
+
+    /// Resolve a local reusable Response Object through its JSON Pointer.
+    ///
+    /// Real-world documents occasionally store a structurally valid Response
+    /// Object under the wrong Components map. Resolving the pointer itself
+    /// preserves compatibility with those documents while still validating
+    /// that the target can be interpreted as a Response Object.
+    fn resolve_response(
+        &self,
+        response: &crate::openapi::Response,
+    ) -> Result<crate::openapi::Response> {
+        let mut current = response.clone();
+        let mut visited = HashSet::new();
+        while let Some(reference) = current.reference.clone() {
+            if !visited.insert(reference.clone()) {
+                return Err(GeneratorError::CircularDependency(format!(
+                    "response reference {reference}"
+                )));
+            }
+
+            let pointer = reference.strip_prefix('#').ok_or_else(|| {
+                GeneratorError::UnresolvedReference(format!(
+                    "external response reference `{reference}` is not supported"
+                ))
+            })?;
+            if !pointer.is_empty() && !pointer.starts_with('/') {
+                return Err(GeneratorError::UnresolvedReference(format!(
+                    "response reference `{reference}` is not a local JSON Pointer"
+                )));
+            }
+            let value = self.openapi_spec.pointer(pointer).ok_or_else(|| {
+                GeneratorError::UnresolvedReference(format!(
+                    "response reference `{reference}` does not exist"
+                ))
+            })?;
+            let object = value.as_object().ok_or_else(|| {
+                GeneratorError::InvalidSchema(format!(
+                    "response reference `{reference}` must target an object"
+                ))
+            })?;
+            if !["$ref", "description", "headers", "content", "links"]
+                .iter()
+                .any(|field| object.contains_key(*field))
+            {
+                return Err(GeneratorError::InvalidSchema(format!(
+                    "response reference `{reference}` does not target a structurally compatible OpenAPI Response Object"
+                )));
+            }
+            current = serde_json::from_value(value.clone()).map_err(|error| {
+                GeneratorError::InvalidSchema(format!(
+                    "response reference `{reference}` is not a valid OpenAPI Response Object: {error}"
+                ))
+            })?;
+        }
+        Ok(current)
     }
 
     /// Generate a type name for an inline response schema.
@@ -4768,24 +5497,6 @@ impl SchemaAnalyzer {
         std::borrow::Cow::Borrowed(param)
     }
 
-    /// Resolve a response reference (`#/components/responses/...`) to the
-    /// reusable response object. Without this, spec-first server generation
-    /// silently drops typed response variants for common shared error
-    /// envelopes.
-    fn resolve_response<'a>(
-        &'a self,
-        response: &'a crate::openapi::Response,
-    ) -> std::borrow::Cow<'a, crate::openapi::Response> {
-        if let Some(ref_str) = response.reference.as_deref() {
-            if let Some(response_name) = ref_str.strip_prefix("#/components/responses/") {
-                if let Some(resolved) = self.component_responses.get(response_name) {
-                    return std::borrow::Cow::Borrowed(resolved);
-                }
-            }
-        }
-        std::borrow::Cow::Borrowed(response)
-    }
-
     /// Analyze a parameter.
     ///
     /// `operation_id` is used to generate a unique synthetic enum type name
@@ -4794,10 +5505,19 @@ impl SchemaAnalyzer {
     /// alongside the operation methods. See issue #10 follow-up.
     /// Look up `#/components/schemas/{name}` in the raw OpenAPI document and
     /// decide whether it's a string with enum values. Used by analyze_parameter
-    /// (T10) so that only string-enum refs flow through to the codegen-typed
-    /// parameter path; struct/object refs stay as `String` until we have
-    /// proper deepObject / form-style query serialization (T14).
+    /// (T10). String-enum refs flow through to the codegen-typed parameter
+    /// path; object refs are typed only when form-exploded (issue #27), and
+    /// other struct refs stay `String` until deepObject / explode=false
+    /// serialization is generated (T14).
     fn referenced_schema_is_string_enum(&self, name: &str) -> bool {
+        if self.resolve_cached_schema(name).is_some_and(|schema| {
+            matches!(
+                schema.schema_type,
+                SchemaType::StringEnum { .. } | SchemaType::ExtensibleEnum { .. }
+            )
+        }) {
+            return true;
+        }
         let Some(schema_value) = self
             .openapi_spec
             .get("components")
@@ -4816,43 +5536,191 @@ impl SchemaAnalyzer {
         is_string_type && has_enum_or_const
     }
 
-    fn analyze_parameter(
+    fn resolve_raw_local_reference(&self, value: &Value) -> Option<Value> {
+        let Some(reference) = value.get("$ref").and_then(Value::as_str) else {
+            return Some(value.clone());
+        };
+        let pointer = reference.strip_prefix('#')?;
+        self.openapi_spec.pointer(pointer).cloned()
+    }
+
+    fn raw_request_body_schema(
         &self,
+        operation: Option<&Value>,
+        content_type: &str,
+    ) -> Option<Value> {
+        let request_body = operation?.get("requestBody")?;
+        self.resolve_raw_local_reference(request_body)?
+            .get("content")?
+            .get(content_type)?
+            .get("schema")
+            .cloned()
+    }
+
+    fn raw_parameter_schema(&self, parameter: &Value) -> Option<Value> {
+        self.resolve_raw_local_reference(parameter)?
+            .get("schema")
+            .cloned()
+    }
+
+    fn analyze_parameter(
+        &mut self,
         param: &crate::openapi::Parameter,
         operation_id: &str,
+        raw_validation_schema: Option<Value>,
     ) -> Result<Option<ParameterInfo>> {
         use heck::ToPascalCase;
 
         let name = param.name.as_deref().unwrap_or("");
         let location = param.location.as_deref().unwrap_or("");
         let required = param.required.unwrap_or(false);
+        let validation_schema = match raw_validation_schema {
+            Some(schema) => Some(schema),
+            None => param
+                .schema
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(GeneratorError::ParseError)?,
+        };
 
         let mut rust_type = "String".to_string();
         let mut schema_ref = None;
         let mut enum_values: Option<Vec<String>> = None;
+        let mut enum_varnames: Option<Vec<String>> = None;
+        let mut query_serialization: Option<QuerySerialization> = None;
+
+        // OAS 3.x style/explode resolution for `in: query`. Defaults are
+        // style=form and — for form only — explode=true, so an object/array
+        // query parameter with nothing specified is already form-exploded
+        // per spec (issue #27). deepObject is only defined with explode=true;
+        // an explicit explode=false there is undefined and keeps the fallback.
+        let is_query = location == "query";
+        let is_simple_header = location == "header"
+            && matches!(param.style.as_deref(), None | Some("simple"))
+            && param.explode != Some(true);
+        let form_style = matches!(param.style.as_deref(), None | Some("form"));
+        let form_exploded = form_style && param.explode.unwrap_or(true);
+        let deep_object =
+            param.style.as_deref() == Some("deepObject") && param.explode != Some(false);
+
+        let object_serialization = if !is_query {
+            None
+        } else if deep_object {
+            Some(QuerySerialization::DeepObject)
+        } else if form_exploded {
+            Some(QuerySerialization::FormExplodedObject)
+        } else if form_style {
+            Some(QuerySerialization::FormObject)
+        } else {
+            None
+        };
 
         if let Some(schema) = &param.schema {
             if let Some(ref_str) = schema.reference() {
                 // T10: keep the resolved type when the target is a string-enum
                 // (then `Display`/`as_str` are emitted, see generate_string_enum).
-                // For struct/object refs we fall back to `String` here — those
-                // need deepObject / form / serde_urlencoded handling that's
-                // not yet generated; emitting the typed name would produce
-                // `(struct).to_string()` and not compile.
+                // Object refs on query params with a generated wire style keep
+                // the resolved struct type too (T14/issue #27); anything else
+                // stays on the opaque `String` fallback.
                 if let Some(name) = self.extract_schema_name(ref_str) {
                     if self.referenced_schema_is_string_enum(name) {
                         schema_ref = Some(name.to_string());
+                    } else if object_serialization.is_some()
+                        && self.referenced_schema_is_object(name)
+                    {
+                        schema_ref = Some(name.to_string());
+                        query_serialization = if form_exploded && self.uses_aws_query_conventions()
+                        {
+                            match self.referenced_array_struct_item_type(name, 1) {
+                                Some(ArrayItemType::NestedStructRef { properties, .. }) => {
+                                    Some(QuerySerialization::FormExplodedNestedObject {
+                                        properties,
+                                    })
+                                }
+                                _ => object_serialization.clone(),
+                            }
+                        } else {
+                            object_serialization.clone()
+                        };
+                    } else if (is_query && form_style || is_simple_header)
+                        && let Some(item_type) = self.referenced_array_param_item_type(name)
+                    {
+                        // A parameter may reference a reusable array schema
+                        // rather than declaring `type: array` inline. Preserve
+                        // that component as a pruning root while projecting the
+                        // public parameter type to the same Vec<T> used by
+                        // inline arrays.
+                        schema_ref = Some(name.to_string());
+                        query_serialization = Some(if is_simple_header {
+                            QuerySerialization::SimpleHeaderArray { item_type }
+                        } else if form_exploded {
+                            QuerySerialization::FormExplodedArray { item_type }
+                        } else {
+                            QuerySerialization::FormArray { item_type }
+                        });
                     }
                 }
+            } else if object_serialization.is_some() && Self::schema_is_inline_object(schema) {
+                // Inline object schema on a query parameter with a generated
+                // wire style: synthesize a struct (e.g. `FindWidgetsFilter`)
+                // so the caller passes typed fields instead of a pre-encoded
+                // string.
+                let op_pascal = operation_id.replace('.', "_").to_pascal_case();
+                let param_pascal = name.to_pascal_case();
+                let synthetic_name = format!("{op_pascal}{param_pascal}");
+                let mut deps = HashSet::new();
+                self.add_inline_schema(&synthetic_name, schema, &mut deps)?;
+                schema_ref = Some(synthetic_name.clone());
+                query_serialization = if form_exploded && self.uses_aws_query_conventions() {
+                    match self.referenced_array_struct_item_type(&synthetic_name, 1) {
+                        Some(ArrayItemType::NestedStructRef { properties, .. }) => {
+                            Some(QuerySerialization::FormExplodedNestedObject { properties })
+                        }
+                        _ => object_serialization.clone(),
+                    }
+                } else {
+                    object_serialization.clone()
+                };
+            } else if (is_query && form_style || is_simple_header)
+                && matches!(
+                    schema.schema_type(),
+                    Some(crate::openapi::SchemaType::Array)
+                )
+                && let Some(item_type) = self.array_param_item_type(schema)
+            {
+                // Typed form-style array (openapi-generator-anu): the client
+                // takes `Vec<item_type>` and emits repeated (explode=true) or
+                // comma-joined (explode=false) pairs. `rust_type` deliberately
+                // stays "String" because the shared query-serialization plan
+                // is the authoritative Vec<T> projection. Arrays whose items
+                // don't type (objects, nested arrays) fall through to the
+                // explicit unsupported shape below.
+                query_serialization = Some(if is_simple_header {
+                    QuerySerialization::SimpleHeaderArray { item_type }
+                } else if form_exploded {
+                    QuerySerialization::FormExplodedArray { item_type }
+                } else {
+                    QuerySerialization::FormArray { item_type }
+                });
             } else if let Some(schema_type) = schema.schema_type() {
+                // Route integer/number through the same TypeMapper the schema
+                // property path uses (see analyze_property), so `format: int32`
+                // yields `i32` and `[type_mappings]`/strategy config applies to
+                // parameters too. Hardcoding `i64`/`f64` here previously made
+                // `format` and config impossible to honour for query/path params.
+                let format = schema.details().format.clone();
                 rust_type = match schema_type {
-                    crate::openapi::SchemaType::Boolean => "bool",
-                    crate::openapi::SchemaType::Integer => "i64",
-                    crate::openapi::SchemaType::Number => "f64",
-                    crate::openapi::SchemaType::String => "String",
-                    _ => "String",
-                }
-                .to_string();
+                    crate::openapi::SchemaType::Boolean => "bool".to_string(),
+                    crate::openapi::SchemaType::Integer => {
+                        self.type_mapper.integer_format(format.as_deref()).rust_type
+                    }
+                    crate::openapi::SchemaType::Number => {
+                        self.type_mapper.number_format(format.as_deref()).rust_type
+                    }
+                    crate::openapi::SchemaType::String => "String".to_string(),
+                    _ => "String".to_string(),
+                };
 
                 if matches!(schema_type, crate::openapi::SchemaType::String) {
                     let details = schema.details();
@@ -4862,10 +5730,74 @@ impl SchemaAnalyzer {
                                 let op_pascal = operation_id.replace('.', "_").to_pascal_case();
                                 let param_pascal = name.to_pascal_case();
                                 rust_type = format!("{op_pascal}{param_pascal}");
+                                // Honor `x-enum-varnames` here the same way
+                                // schema-level enums do. A mismatched length is
+                                // ambiguous about which value each name refers
+                                // to, so drop it rather than guess.
+                                enum_varnames = details
+                                    .extra
+                                    .get("x-enum-varnames")
+                                    .and_then(Value::as_array)
+                                    .map(|raw| {
+                                        raw.iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_owned)
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .filter(|names| names.len() == values.len());
                                 enum_values = Some(values);
                             }
                         }
                     }
+                }
+            }
+
+            if is_query && query_serialization.is_none() {
+                let referenced_name = schema
+                    .reference()
+                    .and_then(|reference| self.extract_schema_name(reference));
+                let is_object = referenced_name
+                    .is_some_and(|name| self.referenced_schema_is_object(name))
+                    || Self::schema_is_inline_object(schema);
+                let is_array = referenced_name
+                    .is_some_and(|name| self.referenced_schema_is_array(name))
+                    || matches!(
+                        schema.schema_type(),
+                        Some(crate::openapi::SchemaType::Array)
+                    );
+                let is_composed = referenced_name
+                    .is_some_and(|name| self.referenced_schema_is_composed_query_shape(name));
+                let reason = if param.style.as_deref() == Some("deepObject")
+                    && param.explode == Some(false)
+                {
+                    Some("style=deepObject with explode=false is undefined by OpenAPI".to_string())
+                } else if param.style.as_deref() == Some("deepObject") && !is_object {
+                    Some("style=deepObject is defined only for object query parameters".to_string())
+                } else if is_object {
+                    Some(format!(
+                        "object query parameters do not support style={}",
+                        param.style.as_deref().unwrap_or("form")
+                    ))
+                } else if is_array && form_style {
+                    Some(
+                        "form array query parameter exceeds the supported nesting bound or contains a non-scalar leaf; supported shapes are scalar arrays, arrays of flat scalar objects, and one nested scalar-object array"
+                            .to_string(),
+                    )
+                } else if is_array {
+                    Some(format!(
+                        "array query parameters do not yet support style={}",
+                        param.style.as_deref().unwrap_or("form")
+                    ))
+                } else if is_composed {
+                    Some(
+                        "composed or union query schemas cannot be projected to an unambiguous flat wire shape"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    query_serialization = Some(QuerySerialization::Unsupported { reason });
                 }
             }
         }
@@ -4878,7 +5810,306 @@ impl SchemaAnalyzer {
             rust_type,
             description: param.description.clone(),
             enum_values,
+            enum_varnames,
             rust_ident: None,
+            query_serialization,
+            validation_schema,
         }))
+    }
+
+    /// Rust item type for a typed array query parameter
+    /// (openapi-generator-anu). Scalar items map through the TypeMapper;
+    /// $ref items resolve when the target is a scalar alias or generated
+    /// string enum (both support the client/server string wire projection).
+    /// Anything else — objects, nested arrays — returns None and the
+    /// parameter keeps the opaque-string fallback. Inline-enum'd string
+    /// items stay plain `String`: the op-scoped enum synthesis (issue #10)
+    /// is wired for scalar params only.
+    fn array_param_item_type(&self, schema: &crate::openapi::Schema) -> Option<ArrayItemType> {
+        let items = schema.details().items.as_deref()?;
+        // AWS query-protocol specs wrap item refs in an annotation-only allOf
+        // (`items: {allOf: [$ref, {xml: ...}]}`). See through the wrapper when
+        // every sibling is annotation-only, mirroring the type-alias rule.
+        let unwrapped = unwrap_annotation_allof(items);
+        if let Some(ref_str) = unwrapped.reference() {
+            let name = self.extract_schema_name(ref_str)?;
+            return self
+                .referenced_array_scalar_item_type(name)
+                .or_else(|| self.referenced_array_struct_item_type(name, 1));
+        }
+        let format = unwrapped.details().format.clone();
+        let scalar = match unwrapped.schema_type()? {
+            crate::openapi::SchemaType::String => "String".to_string(),
+            crate::openapi::SchemaType::Integer => {
+                self.type_mapper.integer_format(format.as_deref()).rust_type
+            }
+            crate::openapi::SchemaType::Number => {
+                self.type_mapper.number_format(format.as_deref()).rust_type
+            }
+            crate::openapi::SchemaType::Boolean => "bool".to_string(),
+            _ => return None,
+        };
+        Some(ArrayItemType::Scalar(scalar))
+    }
+
+    /// Resolve a reusable component array (including `$ref` aliases) and
+    /// apply the same item projection as an inline array parameter.
+    fn referenced_array_param_item_type(&self, name: &str) -> Option<ArrayItemType> {
+        let schema = self.resolve_cached_schema(name)?;
+        let SchemaType::Array { item_type } = &schema.schema_type else {
+            return None;
+        };
+        self.analyzed_array_item_type(item_type)
+    }
+
+    fn analyzed_array_item_type(&self, item_type: &SchemaType) -> Option<ArrayItemType> {
+        self.analyzed_array_item_type_at_depth(item_type, 1)
+    }
+
+    /// Accept a referenced structure as a form-style array item when every
+    /// property is scalar (AWS query-protocol flat structures such as
+    /// `Tag { Key, Value }`). Nested objects, arrays, and maps are rejected
+    /// because the wire shape below one level is service-specific.
+    fn referenced_array_struct_item_type(
+        &self,
+        name: &str,
+        nested_array_depth: usize,
+    ) -> Option<ArrayItemType> {
+        let resolved = self.resolve_cached_schema(name)?;
+        let SchemaType::Object {
+            properties,
+            required,
+            additional_properties,
+        } = &resolved.schema_type
+        else {
+            return None;
+        };
+        if properties.is_empty()
+            || !matches!(additional_properties, ObjectAdditionalProperties::Forbidden)
+        {
+            return None;
+        }
+        let mut projected = Vec::with_capacity(properties.len());
+        let mut has_array = false;
+        for (wire_name, property) in properties {
+            let value_type = if let Some(scalar) = self.query_scalar_type(&property.schema_type) {
+                QueryStructPropertyType::Scalar(scalar)
+            } else {
+                if nested_array_depth == 0 {
+                    return None;
+                }
+                if let Some(array) = self.resolve_query_array_type(&property.schema_type) {
+                    let item_type =
+                        self.analyzed_array_item_type_at_depth(array, nested_array_depth - 1)?;
+                    if matches!(item_type, ArrayItemType::NestedStructRef { .. }) {
+                        return None;
+                    }
+                    has_array = true;
+                    QueryStructPropertyType::Array { item_type }
+                } else {
+                    has_array = true;
+                    QueryStructPropertyType::Object {
+                        properties: self.query_flat_object_properties(&property.schema_type)?,
+                    }
+                }
+            };
+            projected.push(QueryStructProperty {
+                wire_name: wire_name.clone(),
+                required: required.contains(wire_name),
+                value_type,
+            });
+        }
+        if has_array {
+            Some(ArrayItemType::NestedStructRef {
+                schema_name: name.to_string(),
+                properties: projected,
+            })
+        } else {
+            Some(ArrayItemType::FlatStructRef {
+                schema_name: name.to_string(),
+                properties: projected,
+            })
+        }
+    }
+
+    fn analyzed_array_item_type_at_depth(
+        &self,
+        item_type: &SchemaType,
+        nested_array_depth: usize,
+    ) -> Option<ArrayItemType> {
+        match item_type {
+            SchemaType::Primitive { rust_type, .. } => {
+                Some(ArrayItemType::Scalar(rust_type.clone()))
+            }
+            SchemaType::Reference { target } => self
+                .referenced_array_scalar_item_type(target)
+                .or_else(|| self.referenced_array_struct_item_type(target, nested_array_depth)),
+            _ => None,
+        }
+    }
+
+    fn resolve_query_array_type<'a>(
+        &'a self,
+        schema_type: &'a SchemaType,
+    ) -> Option<&'a SchemaType> {
+        match schema_type {
+            SchemaType::Array { item_type } => Some(item_type),
+            SchemaType::Reference { target } => {
+                let resolved = self.resolve_cached_schema(target)?;
+                let SchemaType::Array { item_type } = &resolved.schema_type else {
+                    return None;
+                };
+                Some(item_type)
+            }
+            _ => None,
+        }
+    }
+
+    fn query_flat_object_properties(
+        &self,
+        schema_type: &SchemaType,
+    ) -> Option<Vec<QueryStructProperty>> {
+        let schema_type = match schema_type {
+            SchemaType::Reference { target } => &self.resolve_cached_schema(target)?.schema_type,
+            other => other,
+        };
+        let SchemaType::Object {
+            properties,
+            required,
+            additional_properties,
+        } = schema_type
+        else {
+            return None;
+        };
+        if properties.is_empty()
+            || !matches!(additional_properties, ObjectAdditionalProperties::Forbidden)
+        {
+            return None;
+        }
+        properties
+            .iter()
+            .map(|(wire_name, property)| {
+                Some(QueryStructProperty {
+                    wire_name: wire_name.clone(),
+                    required: required.contains(wire_name),
+                    value_type: QueryStructPropertyType::Scalar(
+                        self.query_scalar_type(&property.schema_type)?,
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    fn query_scalar_type(&self, schema_type: &SchemaType) -> Option<QueryScalarType> {
+        match schema_type {
+            SchemaType::Primitive { rust_type, .. } => match rust_type.as_str() {
+                "String" => Some(QueryScalarType::String),
+                "bool" => Some(QueryScalarType::Boolean),
+                value if value.starts_with('i') || value.starts_with('u') => {
+                    Some(QueryScalarType::Integer)
+                }
+                value if value.starts_with('f') => Some(QueryScalarType::Number),
+                "serde_json::Value" => None,
+                _ => Some(QueryScalarType::String),
+            },
+            SchemaType::StringEnum { .. } | SchemaType::ExtensibleEnum { .. } => {
+                Some(QueryScalarType::String)
+            }
+            SchemaType::Reference { target } => {
+                let resolved = self.resolve_cached_schema(target)?;
+                self.query_scalar_type(&resolved.schema_type)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a referenced array item through any alias chain while
+    /// preserving the outer schema name used by the public `Vec<T>` type.
+    ///
+    /// `SchemaType::Primitive` also represents dynamic JSON/object fallbacks,
+    /// so require an actual OpenAPI scalar `type` before accepting it as a
+    /// form-style query item. Unresolved and cyclic chains are rejected by
+    /// `resolve_cached_schema`.
+    fn referenced_array_scalar_item_type(&self, name: &str) -> Option<ArrayItemType> {
+        let resolved = self.resolve_cached_schema(name)?;
+        let supported = match &resolved.schema_type {
+            SchemaType::StringEnum { .. } | SchemaType::ExtensibleEnum { .. } => true,
+            SchemaType::Primitive { .. } => resolved
+                .original
+                .get("type")
+                .is_some_and(Self::query_scalar_type_value),
+            _ => false,
+        };
+        supported.then(|| ArrayItemType::SchemaRef(name.to_string()))
+    }
+
+    fn query_scalar_type_value(value: &Value) -> bool {
+        const SCALARS: [&str; 4] = ["string", "integer", "number", "boolean"];
+        if let Some(value) = value.as_str() {
+            return SCALARS.contains(&value);
+        }
+        let Some(values) = value.as_array() else {
+            return false;
+        };
+        if !values.iter().all(Value::is_string) {
+            return false;
+        }
+        let mut non_null = values
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|value| *value != "null");
+        let Some(scalar) = non_null.next() else {
+            return false;
+        };
+        non_null.next().is_none() && SCALARS.contains(&scalar)
+    }
+
+    /// True when a component (following `$ref` aliases) analyzes to an object.
+    /// Used to decide whether a referenced query parameter can use a typed
+    /// object serialization plan (issue #27).
+    fn referenced_schema_is_object(&self, name: &str) -> bool {
+        self.resolve_cached_schema(name)
+            .is_some_and(|schema| matches!(schema.schema_type, SchemaType::Object { .. }))
+    }
+
+    fn referenced_schema_is_array(&self, name: &str) -> bool {
+        self.resolve_cached_schema(name)
+            .is_some_and(|schema| matches!(schema.schema_type, SchemaType::Array { .. }))
+    }
+
+    fn referenced_schema_is_composed_query_shape(&self, name: &str) -> bool {
+        self.resolve_cached_schema(name).is_some_and(|schema| {
+            matches!(
+                schema.schema_type,
+                SchemaType::Composition { .. }
+                    | SchemaType::Union { .. }
+                    | SchemaType::DiscriminatedUnion { .. }
+            )
+        })
+    }
+
+    fn resolve_cached_schema(&self, name: &str) -> Option<&AnalyzedSchema> {
+        let mut current = name;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+            let schema = self.resolved_cache.get(current)?;
+            if let SchemaType::Reference { target } = &schema.schema_type {
+                current = target;
+            } else {
+                return Some(schema);
+            }
+        }
+    }
+
+    /// Inline-schema counterpart of [`Self::referenced_schema_is_object`].
+    fn schema_is_inline_object(schema: &crate::openapi::Schema) -> bool {
+        match schema.schema_type() {
+            Some(crate::openapi::SchemaType::Object) => true,
+            None => schema.details().properties.is_some(),
+            _ => false,
+        }
     }
 }
