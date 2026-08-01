@@ -43,6 +43,18 @@ fn requirements_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/headers": {
+                "get": {
+                    "operationId": "headerOnly",
+                    "parameters": [{
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": { "204": { "description": "ok" } }
+                }
+            },
             "/form": {
                 "post": {
                     "operationId": "submitForm",
@@ -336,6 +348,8 @@ fn validation_disabled_server_accepts_scalar_string_headers() {
             enable_sse_client: false,
             tracing_enabled: false,
             server: Some(ServerSection {
+                operations: vec!["headerOnly".into()],
+                prune_models: true,
                 validation: ServerValidationSection {
                     enabled: false,
                     ..Default::default()
@@ -349,6 +363,8 @@ fn validation_disabled_server_accepts_scalar_string_headers() {
     assert!(!dependency_names(&result).contains("jsonschema"));
     assert!(!dependency_names(&result).contains("http-body-util"));
     assert!(!dependency_names(&result).contains("mime"));
+    assert!(!dependency_names(&result).contains("url"));
+    assert!(!dependency_names(&result).contains("serde_urlencoded"));
 }
 
 #[test]

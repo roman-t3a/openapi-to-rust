@@ -6,6 +6,13 @@ when correcting output that was wrong or incomplete on the wire.
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-08-01
+
+### Fixed
+
+- Emit the scalar decoder for validation-disabled, headers-only Axum routers
+  without pulling query-string dependencies into generated projects.
+
 ## [0.12.3] - 2026-08-01
 
 ### Fixed
@@ -343,7 +350,8 @@ would have passed any amount of spec-diffing.
   signed enum values, recursive unions, parameter collisions, optional request
   bodies, range response codes, and path-segment encoding.
 
-[Unreleased]: https://github.com/roman-t3a/openapi-to-rust/compare/v0.12.3...HEAD
+[Unreleased]: https://github.com/roman-t3a/openapi-to-rust/compare/v0.12.4...HEAD
+[0.12.4]: https://github.com/roman-t3a/openapi-to-rust/releases/tag/v0.12.4
 [0.12.3]: https://github.com/roman-t3a/openapi-to-rust/releases/tag/v0.12.3
 [0.12.2]: https://github.com/roman-t3a/openapi-to-rust/releases/tag/v0.12.2
 [0.12.1]: https://github.com/roman-t3a/openapi-to-rust/releases/tag/v0.12.1

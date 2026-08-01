@@ -1140,6 +1140,32 @@ impl<'a> ServerCodegen<'a> {
                 .iter()
                 .any(|parameter| parameter.location == "query")
         });
+        let needs_scalar_decoder = has_query_parameters
+            || groups.values().flatten().any(|operation| {
+                operation.parameters.iter().any(|parameter| {
+                    parameter.location == "header"
+                        && (validation_bundle.is_none()
+                            || matches!(
+                                parameter.query_serialization,
+                                Some(QuerySerialization::SimpleHeaderArray { .. })
+                            ))
+                })
+            });
+        let scalar_decoder = needs_scalar_decoder.then(|| {
+            quote! {
+                fn __decode_query_scalar<T>(
+                    value: &str,
+                    label: &str,
+                ) -> ::std::result::Result<T, String>
+                where
+                    T: ::serde::de::DeserializeOwned,
+                {
+                    ::serde_json::from_value(::serde_json::Value::String(value.to_string()))
+                        .or_else(|_| ::serde_json::from_str(value))
+                        .map_err(|error| format!("invalid query value for `{label}`: {error}"))
+                }
+            }
+        });
         let query_helpers = has_query_parameters.then(|| {
             quote! {
                 fn __query_pairs(raw: ::std::option::Option<&str>) -> ::std::vec::Vec<(String, String)> {
@@ -1183,18 +1209,6 @@ impl<'a> ServerCodegen<'a> {
                         return Err(format!("query parameter `{key}` appeared more than once"));
                     }
                     Ok(value)
-                }
-
-                fn __decode_query_scalar<T>(
-                    value: &str,
-                    label: &str,
-                ) -> ::std::result::Result<T, String>
-                where
-                    T: ::serde::de::DeserializeOwned,
-                {
-                    ::serde_json::from_value(::serde_json::Value::String(value.to_string()))
-                        .or_else(|_| ::serde_json::from_str(value))
-                        .map_err(|error| format!("invalid query value for `{label}`: {error}"))
                 }
 
                 fn __decode_query_object<T>(
@@ -1256,6 +1270,7 @@ impl<'a> ServerCodegen<'a> {
             #[allow(unused_imports)]
             use super::super::types::*;
 
+            #scalar_decoder
             #query_helpers
 
             #(#query_structs)*
