@@ -2187,7 +2187,7 @@ impl CodeGenerator {
                 let wire_name = property.wire_name;
                 quote! {
                     #[doc = concat!("Set the optional `", #wire_name, "` request field.")]
-                    #[must_use]
+                    #[must_use = "builder methods return the updated builder"]
                     pub fn #setter_ident(mut self, #field_ident: #field_type) -> Self {
                         self.value.#field_ident = Some(#field_ident);
                         self
@@ -2200,7 +2200,7 @@ impl CodeGenerator {
             crate::analysis::ObjectAdditionalProperties::Forbidden => TokenStream::new(),
             crate::analysis::ObjectAdditionalProperties::Untyped => quote! {
                 /// Replace the request's additional properties.
-                #[must_use]
+                #[must_use = "builder methods return the updated builder"]
                 pub fn additional_properties(
                     mut self,
                     additional_properties: ::std::collections::BTreeMap<
@@ -2216,7 +2216,7 @@ impl CodeGenerator {
                 let value_type = self.generate_array_item_type(value_type, analysis);
                 quote! {
                     /// Replace the request's additional properties.
-                    #[must_use]
+                    #[must_use = "builder methods return the updated builder"]
                     pub fn additional_properties(
                         mut self,
                         additional_properties: ::std::collections::BTreeMap<

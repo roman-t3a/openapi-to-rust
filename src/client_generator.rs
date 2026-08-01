@@ -695,7 +695,7 @@ impl CodeGenerator {
                 };
                 setters.push(quote! {
                     #[doc = concat!("Set the optional `", #wire_name, "` operation parameter.")]
-                    #[must_use]
+                    #[must_use = "builder methods return the updated builder"]
                     pub fn #setter_ident(mut self, #field_ident: #setter_type) -> Self {
                         #assignment
                         self
@@ -757,7 +757,7 @@ impl CodeGenerator {
             };
             setters.push(quote! {
                 /// Replace the complete request body.
-                #[must_use]
+                #[must_use = "builder methods return the updated builder"]
                 pub fn #body_setter(mut self, #body_ident: #body_type) -> Self {
                     #body_assignment
                     self
@@ -792,7 +792,7 @@ impl CodeGenerator {
                     };
                     setters.push(quote! {
                         #[doc = concat!("Set the optional request-body field `", #wire_name, "`.")]
-                        #[must_use]
+                        #[must_use = "builder methods return the updated builder"]
                         pub fn #setter_ident(mut self, #value_ident: #value_type) -> Self {
                             #assignment
                             self
