@@ -6,6 +6,13 @@ when correcting output that was wrong or incomplete on the wire.
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-08-01
+
+### Fixed
+
+- Restore validation-disabled server generation for scalar string headers, so
+  upgrading does not force request-schema validation onto existing Axum edges.
+
 ## [0.12.1] - 2026-08-01
 
 ### Fork compatibility
@@ -329,7 +336,8 @@ would have passed any amount of spec-diffing.
   signed enum values, recursive unions, parameter collisions, optional request
   bodies, range response codes, and path-segment encoding.
 
-[Unreleased]: https://github.com/roman-t3a/openapi-to-rust/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/roman-t3a/openapi-to-rust/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/roman-t3a/openapi-to-rust/releases/tag/v0.12.2
 [0.12.1]: https://github.com/roman-t3a/openapi-to-rust/releases/tag/v0.12.1
 [0.12.0]: https://github.com/gpu-cli/openapi-to-rust/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/gpu-cli/openapi-to-rust/compare/v0.10.0...v0.11.0

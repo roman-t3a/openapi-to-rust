@@ -498,18 +498,21 @@ impl<'a> ServerCodegen<'a> {
         self.validate_supported_server_outputs(&ops)?;
         if !self.server.validation.enabled
             && ops.iter().any(|operation| {
-                operation
-                    .parameters
-                    .iter()
-                    .any(|parameter| matches!(parameter.location.as_str(), "header" | "cookie"))
-                    || matches!(
-                        &operation.request_body,
-                        Some(RequestBodyContent::FormUrlEncoded { .. })
-                    )
+                operation.parameters.iter().any(|parameter| {
+                    parameter.location == "cookie"
+                        || (parameter.location == "header"
+                            && matches!(
+                                parameter.query_serialization,
+                                Some(QuerySerialization::SimpleHeaderArray { .. })
+                            ))
+                }) || matches!(
+                    &operation.request_body,
+                    Some(RequestBodyContent::FormUrlEncoded { .. })
+                )
             })
         {
             return Err(ServerCodegenError::Validation(
-                "typed header/cookie and form extraction requires server.validation.enabled=true"
+                "cookie, collection header, and form extraction requires server.validation.enabled=true"
                     .to_string(),
             ));
         }
@@ -1752,9 +1755,13 @@ impl<'a> ServerCodegen<'a> {
                             let #ident: #ty = match __headers.get(#wire).and_then(|v| v.to_str().ok()) {
                                 Some(raw) => match __decode_query_scalar(raw, #wire) {
                                     Ok(value) => value,
-                                    Err(_) => return ::axum::http::StatusCode::BAD_REQUEST.into_response(),
+                                    Err(_) => return ::axum::response::IntoResponse::into_response(
+                                        ::axum::http::StatusCode::BAD_REQUEST
+                                    ),
                                 },
-                                None => return ::axum::http::StatusCode::BAD_REQUEST.into_response(),
+                                None => return ::axum::response::IntoResponse::into_response(
+                                    ::axum::http::StatusCode::BAD_REQUEST
+                                ),
                             };
                         });
                     }

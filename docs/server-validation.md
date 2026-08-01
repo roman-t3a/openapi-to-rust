@@ -16,8 +16,9 @@ max_errors = 16
 Validation is enabled by default. `max_body_bytes` accepts 1 through 67,108,864
 bytes; `max_errors` accepts 1 through 100. These bounds are checked both while
 loading TOML and at the code-generation boundary for programmatically-created
-configuration. Disabling validation is an explicit compatibility escape hatch;
-typed header, cookie, and form extraction currently requires validation.
+configuration. Disabling validation is an explicit compatibility escape hatch.
+Cookie, collection-header, and form extraction currently requires validation;
+scalar string headers retain the validation-disabled compatibility path.
 
 The generator selects Draft 4 semantics for OpenAPI 3.0 and Draft 2020-12 for
 OpenAPI 3.1/3.2. It embeds the transitive local component-schema closure into one

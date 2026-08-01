@@ -15,14 +15,22 @@ fn requirements_spec() -> serde_json::Value {
                 "get": {
                     "operationId": "listItems",
                     "tags": ["Items"],
-                    "parameters": [{
-                        "name": "filter",
-                        "in": "query",
-                        "required": true,
-                        "style": "deepObject",
-                        "explode": true,
-                        "schema": { "$ref": "#/components/schemas/QueryFilter" }
-                    }],
+                    "parameters": [
+                        {
+                            "name": "filter",
+                            "in": "query",
+                            "required": true,
+                            "style": "deepObject",
+                            "explode": true,
+                            "schema": { "$ref": "#/components/schemas/QueryFilter" }
+                        },
+                        {
+                            "name": "Idempotency-Key",
+                            "in": "header",
+                            "required": true,
+                            "schema": { "type": "string" }
+                        }
+                    ],
                     "responses": {
                         "200": {
                             "description": "ok",
@@ -317,6 +325,30 @@ fn multipart_server_enables_axum_multipart_feature() {
         .find(|dependency| dependency.crate_name == "axum")
         .expect("axum dependency");
     assert_eq!(axum.features, vec!["json", "multipart"]);
+}
+
+#[test]
+fn validation_disabled_server_accepts_scalar_string_headers() {
+    let result = compile_case(
+        "scalar-header-without-validation",
+        GeneratorConfig {
+            enable_async_client: false,
+            enable_sse_client: false,
+            tracing_enabled: false,
+            server: Some(ServerSection {
+                validation: ServerValidationSection {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..plain_server_config()
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert!(!dependency_names(&result).contains("jsonschema"));
+    assert!(!dependency_names(&result).contains("http-body-util"));
+    assert!(!dependency_names(&result).contains("mime"));
 }
 
 #[test]
