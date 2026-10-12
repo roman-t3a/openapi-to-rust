@@ -4,7 +4,7 @@ use std::fs;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read the anthropic fixture
     let content = fs::read_to_string("tests/fixtures/anthropic.yml")?;
-    let spec: serde_json::Value = serde_yaml_ng::from_str(&content)?;
+    let spec: serde_json::Value = yaml_serde::from_str(&content)?;
 
     println!("Creating analyzer...");
     let mut analyzer = SchemaAnalyzer::new(spec)?;

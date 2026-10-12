@@ -41,8 +41,8 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 url = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Maintained drop-in fork of the archived serde_yaml crate.
-serde_yaml_ng = "0.10"
+# Maintained by the YAML organization, including the libyaml-rs backend.
+yaml_serde = "0.10.7"
 syn = { version = "2.0", features = ["parsing"] }
 thiserror = "2.0"
 tempfile = { version = "3.0", optional = true }
@@ -55,7 +55,7 @@ jsonschema = { version = "0.49", default-features = false }
 regex = "1"
 
 [dev-dependencies]
-serde_yaml_ng = "0.10"
+yaml_serde = "0.10.7"
 insta = { version = "1.41", features = ["yaml"] }
 tempfile = "3.0"
 

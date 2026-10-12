@@ -190,7 +190,7 @@ fn parse_fixture_header(root: &Path, path: &Path) -> Fixture {
 
 fn run(fixture: &Fixture) -> Outcome {
     let body = fs::read_to_string(&fixture.path).expect("read fixture");
-    let parsed: Result<OpenApiSpec, _> = serde_yaml_ng::from_str(&body);
+    let parsed: Result<OpenApiSpec, _> = yaml_serde::from_str(&body);
     let mut outcome = Outcome::default();
     let spec = match parsed {
         Ok(s) => {

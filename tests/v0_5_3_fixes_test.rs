@@ -237,8 +237,10 @@ fn library_dependency_graph_has_no_http_or_archived_yaml() {
         "native-tls",
         "openssl",
         "rustls-pemfile",
-        // Archived crate name appears as `serde_yaml v…` (not serde_yaml_ng).
+        // Neither the archived parser nor its unmaintained backend may return.
         "serde_yaml v",
+        "serde_yaml_ng v",
+        "unsafe-libyaml v",
     ] {
         assert!(
             !tree.lines().any(|l| l.contains(forbidden)),
@@ -248,8 +250,8 @@ fn library_dependency_graph_has_no_http_or_archived_yaml() {
 
     // Positive checks: we want the maintained yaml fork, and no reqwest by default.
     assert!(
-        tree.contains("serde_yaml_ng"),
-        "expected serde_yaml_ng in default tree:\n{tree}"
+        tree.contains("yaml_serde"),
+        "expected yaml_serde in library-only tree:\n{tree}"
     );
     assert!(
         !tree.lines().any(|l| l.starts_with("reqwest ")),

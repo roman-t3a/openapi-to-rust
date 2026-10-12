@@ -316,7 +316,7 @@ fn storyden_generated_client_round_trips_raw_bodies_through_generated_server() {
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(manifest_dir.join("specs/storyden.yaml"))
         .expect("read vendored Storyden spec");
-    let spec = serde_yaml_ng::from_str(&source).expect("parse vendored Storyden spec");
+    let spec = yaml_serde::from_str(&source).expect("parse vendored Storyden spec");
     let selected = vec![
         "IconUpload".to_string(),
         "PluginUpdatePackage".to_string(),

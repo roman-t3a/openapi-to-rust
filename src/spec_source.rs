@@ -2,7 +2,7 @@
 //! consumers, and the WASM playground build.
 //!
 //! Everything in this module is pure: URL policy checks build on `url::Url`
-//! and document parsing goes through `serde_yaml_ng`/`serde_json` in memory. The
+//! and document parsing goes through `yaml_serde`/`serde_json` in memory. The
 //! I/O that actually fetches or reads a spec lives in [`crate::cli`], which is
 //! gated behind the `cli` feature.
 
@@ -107,22 +107,22 @@ pub fn parse_spec(
 }
 
 /// Parse YAML to serde_json::Value, converting large numbers to f64 to avoid overflow.
-/// serde_yaml_ng cannot represent integers exceeding i64/u64 range (e.g. numbers > 2^64),
+/// yaml_serde cannot represent integers exceeding i64/u64 range (e.g. numbers > 2^64),
 /// so we preprocess the YAML to convert such numbers to float notation, then go through
-/// serde_yaml_ng::Value and convert to serde_json::Value manually.
+/// yaml_serde::Value and convert to serde_json::Value manually.
 pub fn yaml_to_json_value(content: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let preprocessed = sanitize_large_yaml_integers(content);
-    match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&preprocessed) {
+    match yaml_serde::from_str::<yaml_serde::Value>(&preprocessed) {
         Ok(yaml_value) => Ok(yaml_value_to_json(yaml_value)),
         Err(error) => {
             // Real-world specs (Adyen, Amadeus) carry literal tab characters
             // inside block-scalar prose. YAML 1.2 forbids tabs for
-            // indentation, and serde_yaml_ng rejects the document outright even
+            // indentation, and yaml_serde rejects the document outright even
             // when the tab is content. Retry once with tabs sanitized
             // line-wise so block-scalar indentation survives.
             if error.to_string().contains("tab character") {
                 let expanded = expand_yaml_tabs(&preprocessed);
-                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&expanded)?;
+                let yaml_value: yaml_serde::Value = yaml_serde::from_str(&expanded)?;
                 return Ok(yaml_value_to_json(yaml_value));
             }
             Err(error.into())
@@ -139,7 +139,7 @@ pub fn json_from_str_lossy(content: &str) -> Result<serde_json::Value, Box<dyn s
             let err_msg = e.to_string();
             if err_msg.contains("number out of range") {
                 // Fall back: parse via YAML which handles large numbers
-                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(content)?;
+                let yaml_value: yaml_serde::Value = yaml_serde::from_str(content)?;
                 Ok(yaml_value_to_json(yaml_value))
             } else {
                 Err(e.into())
@@ -148,11 +148,11 @@ pub fn json_from_str_lossy(content: &str) -> Result<serde_json::Value, Box<dyn s
     }
 }
 
-fn yaml_value_to_json(yaml: serde_yaml_ng::Value) -> serde_json::Value {
+fn yaml_value_to_json(yaml: yaml_serde::Value) -> serde_json::Value {
     match yaml {
-        serde_yaml_ng::Value::Null => serde_json::Value::Null,
-        serde_yaml_ng::Value::Bool(b) => serde_json::Value::Bool(b),
-        serde_yaml_ng::Value::Number(n) => {
+        yaml_serde::Value::Null => serde_json::Value::Null,
+        yaml_serde::Value::Bool(b) => serde_json::Value::Bool(b),
+        yaml_serde::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 serde_json::Value::Number(i.into())
             } else if let Some(u) = n.as_u64() {
@@ -164,18 +164,18 @@ fn yaml_value_to_json(yaml: serde_yaml_ng::Value) -> serde_json::Value {
                 serde_json::json!(0.0)
             }
         }
-        serde_yaml_ng::Value::String(s) => serde_json::Value::String(s),
-        serde_yaml_ng::Value::Sequence(seq) => {
+        yaml_serde::Value::String(s) => serde_json::Value::String(s),
+        yaml_serde::Value::Sequence(seq) => {
             serde_json::Value::Array(seq.into_iter().map(yaml_value_to_json).collect())
         }
-        serde_yaml_ng::Value::Mapping(map) => {
+        yaml_serde::Value::Mapping(map) => {
             let obj = map
                 .into_iter()
                 .filter_map(|(k, v)| {
                     let key = match k {
-                        serde_yaml_ng::Value::String(s) => s,
-                        serde_yaml_ng::Value::Number(n) => n.to_string(),
-                        serde_yaml_ng::Value::Bool(b) => b.to_string(),
+                        yaml_serde::Value::String(s) => s,
+                        yaml_serde::Value::Number(n) => n.to_string(),
+                        yaml_serde::Value::Bool(b) => b.to_string(),
                         _ => return None,
                     };
                     Some((key, yaml_value_to_json(v)))
@@ -183,11 +183,11 @@ fn yaml_value_to_json(yaml: serde_yaml_ng::Value) -> serde_json::Value {
                 .collect();
             serde_json::Value::Object(obj)
         }
-        serde_yaml_ng::Value::Tagged(tagged) => yaml_value_to_json(tagged.value),
+        yaml_serde::Value::Tagged(tagged) => yaml_value_to_json(tagged.value),
     }
 }
 
-/// Sanitize tab characters so serde_yaml_ng accepts the document: a tab on an
+/// Sanitize tab characters so yaml_serde accepts the document: a tab on an
 /// otherwise whitespace-only line is dropped entirely (blank lines carry no
 /// indentation semantics in block scalars), while tabs adjacent to content
 /// become a single space. This keeps block-scalar indent auto-detection
@@ -208,7 +208,7 @@ fn expand_yaml_tabs(content: &str) -> String {
 }
 
 /// Preprocess YAML content to convert integers that exceed i64/u64 range to float notation.
-/// serde_yaml_ng cannot parse integers larger than u64::MAX or smaller than i64::MIN,
+/// yaml_serde cannot parse integers larger than u64::MAX or smaller than i64::MIN,
 /// so we find bare integer values on YAML lines and append `.0` if they overflow.
 fn sanitize_large_yaml_integers(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
